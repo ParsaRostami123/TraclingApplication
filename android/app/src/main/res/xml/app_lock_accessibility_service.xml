@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:description="@string/app_lock_accessibility_service_description"
+    android:accessibilityEventTypes="typeAllMask|typeWindowContentChanged|typeWindowsChanged|typeWindowStateChanged"
+    android:accessibilityFlags="flagDefault|flagIncludeNotImportantViews|flagReportViewIds|flagRetrieveInteractiveWindows|flagRequestFilterKeyEvents"
+    android:accessibilityFeedbackType="feedbackAllMask"
+    android:notificationTimeout="50"
+    android:canRetrieveWindowContent="true"
+    android:canRequestFilterKeyEvents="true"
+    android:canRequestTouchExplorationMode="false"
+    android:canPerformGestures="true"
+    android:canControlMagnification="true"
+    android:settingsActivity="com.example.flutter_application_512.MainActivity"/> 

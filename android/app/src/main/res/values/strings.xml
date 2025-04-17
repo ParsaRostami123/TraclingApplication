@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">App Usage Tracker</string>
+    <string name="app_lock_accessibility_service_description">This service monitors app usage to enforce time limits set by parents</string>
+    <string name="app_locked_title">App Locked</string>
+    <string name="app_locked_message">Time limit reached for this app</string>
+    <string name="return_to_home">Return to Home</string>
+    <string name="monitoring_app_usage">Monitoring app usage</string>
+</resources> 
