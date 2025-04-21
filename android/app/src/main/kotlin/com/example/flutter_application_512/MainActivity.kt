@@ -145,6 +145,14 @@ class MainActivity: FlutterActivity() {
                     openOverlaySettings()
                     result.success(true)
                 }
+                "requestBatteryOptimizationPermission" -> {
+                    requestBatteryOptimizationPermission()
+                    result.success(true)
+                }
+                "checkBatteryOptimizationPermission" -> {
+                    val isIgnoringBatteryOptimizations = isIgnoringBatteryOptimizations()
+                    result.success(isIgnoringBatteryOptimizations)
+                }
                 "resetAppUsageData" -> {
                     try {
                         resetAppUsageData()
@@ -162,6 +170,28 @@ class MainActivity: FlutterActivity() {
                 "ensureAccessibilityServiceRunning" -> {
                     val success = ensureAccessibilityServiceRunning()
                     result.success(success)
+                }
+                "ensureServiceRunning" -> {
+                    try {
+                        val serviceActive = isServiceRunning()
+                        Log.d(TAG, "Checking if service is running: $serviceActive")
+                        
+                        if (!serviceActive) {
+                            Log.d(TAG, "Service not running, restarting...")
+                            startMonitoringService()
+                        }
+                        
+                        // همچنین سرویس Accessibility را بررسی کن
+                        val accessibilityActive = isAccessibilityServiceEnabled()
+                        if (accessibilityActive) {
+                            ensureAccessibilityServiceRunning()
+                        }
+                        
+                        result.success(true)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error ensuring service is running", e)
+                        result.error("ERROR", "Failed to ensure service is running", e.message)
+                    }
                 }
                 "setAppLockStatus" -> {
                     val packageName = call.argument<String>("packageName")
@@ -1080,5 +1110,38 @@ class MainActivity: FlutterActivity() {
             Log.e(TAG, "Error unlocking app", e)
             result?.error("ERROR", "Failed to unlock app", e.message)
         }
+    }
+
+    private fun isServiceRunning(): Boolean {
+        val manager = applicationContext.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+        for (service in manager.getRunningServices(Integer.MAX_VALUE)) {
+            if (AppLockForegroundService::class.java.name == service.service.className) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private fun requestBatteryOptimizationPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val packageName = applicationContext.packageName
+            val pm = applicationContext.getSystemService(Context.POWER_SERVICE) as PowerManager
+            if (!pm.isIgnoringBatteryOptimizations(packageName)) {
+                val intent = Intent().apply {
+                    action = Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
+                    data = Uri.parse("package:$packageName")
+                }
+                startActivity(intent)
+            }
+        }
+    }
+    
+    private fun isIgnoringBatteryOptimizations(): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val packageName = applicationContext.packageName
+            val pm = applicationContext.getSystemService(Context.POWER_SERVICE) as PowerManager
+            return pm.isIgnoringBatteryOptimizations(packageName)
+        }
+        return false
     }
 }
