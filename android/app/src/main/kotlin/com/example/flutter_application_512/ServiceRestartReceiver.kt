@@ -19,6 +19,7 @@ class ServiceRestartReceiver : BroadcastReceiver() {
         private const val TAG = "ServiceRestartReceiver"
         const val RESTART_ALARM_DELAY = 60000L // 1 minute
         const val ACTION_RESTART_ACCESSIBILITY = "com.example.flutter_application_512.RESTART_ACCESSIBILITY_SERVICE"
+        const val ACTION_CHECK_SERVICES = "com.example.flutter_application_512.CHECK_SERVICES"
     }
 
     override fun onReceive(context: Context, intent: Intent) {
@@ -34,6 +35,12 @@ class ServiceRestartReceiver : BroadcastReceiver() {
             ACTION_RESTART_ACCESSIBILITY -> {
                 Log.d(TAG, "Received explicit restart request")
                 checkAndStartAccessibilityService(context)
+            }
+            ACTION_CHECK_SERVICES -> {
+                Log.d(TAG, "Periodic service check triggered")
+                checkAllServices(context)
+                // تنظیم مجدد آلارم برای بررسی بعدی
+                setupNextServiceCheck(context)
             }
             Intent.ACTION_MY_PACKAGE_REPLACED -> {
                 Log.d(TAG, "App updated, restarting services")
@@ -184,6 +191,66 @@ class ServiceRestartReceiver : BroadcastReceiver() {
             }, 1000)
         } catch (e: Exception) {
             Log.e(TAG, "Error opening accessibility settings", e)
+        }
+    }
+    
+    private fun checkAllServices(context: Context) {
+        // 1. بررسی و راه‌اندازی مجدد سرویس Accessibility
+        checkAndStartAccessibilityService(context)
+        
+        // 2. بررسی و راه‌اندازی مجدد سرویس Foreground 
+        val isForegroundServiceRunning = isServiceRunning(context, AppLockForegroundService::class.java)
+        if (!isForegroundServiceRunning) {
+            Log.d(TAG, "Foreground service is not running, restarting...")
+            startAppLockForegroundService(context)
+        }
+    }
+    
+    private fun isServiceRunning(context: Context, serviceClass: Class<*>): Boolean {
+        val manager = context.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+        for (service in manager.getRunningServices(Integer.MAX_VALUE)) {
+            if (serviceClass.name == service.service.className) {
+                return true
+            }
+        }
+        return false
+    }
+    
+    private fun setupNextServiceCheck(context: Context) {
+        try {
+            val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+            val checkIntent = Intent(context, ServiceRestartReceiver::class.java).apply {
+                action = ACTION_CHECK_SERVICES
+            }
+            
+            val pendingIntent = PendingIntent.getBroadcast(
+                context,
+                0,
+                checkIntent,
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) PendingIntent.FLAG_IMMUTABLE else 0
+            )
+            
+            // تنظیم آلارم برای اجرا 15 دقیقه بعد
+            val startTime = System.currentTimeMillis() + (15 * 60 * 1000L) // 15 دقیقه
+            
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                alarmManager.setExactAndAllowWhileIdle(
+                    AlarmManager.RTC_WAKEUP,
+                    startTime,
+                    pendingIntent
+                )
+            } else {
+                alarmManager.set(
+                    AlarmManager.RTC_WAKEUP,
+                    startTime,
+                    pendingIntent
+                )
+            }
+            
+            Log.d(TAG, "Scheduled next service check in 15 minutes")
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error setting up next service check", e)
         }
     }
 } 

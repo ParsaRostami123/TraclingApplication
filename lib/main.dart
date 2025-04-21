@@ -6,8 +6,56 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'dart:math' as Math;
+import 'package:workmanager/workmanager.dart';
 
-void main() {
+// تعریف کلید برای کار دوره‌ای
+const String serviceCheckTask =
+    "com.example.flutter_application_512.SERVICE_CHECK";
+
+// تابع کار پس‌زمینه که توسط WorkManager اجرا می‌شود
+@pragma('vm:entry-point')
+void callbackDispatcher() {
+  Workmanager().executeTask((taskName, inputData) async {
+    print("Background task: $taskName started");
+
+    if (taskName == serviceCheckTask) {
+      // بررسی و راه‌اندازی مجدد سرویس
+      const platform =
+          MethodChannel('com.example.flutter_application_512/usage_stats');
+      try {
+        await platform.invokeMethod('ensureServiceRunning');
+        print("Service check completed successfully");
+      } catch (e) {
+        print("Error in background task: $e");
+      }
+    }
+
+    return Future.value(true);
+  });
+}
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  // راه‌اندازی WorkManager
+  await Workmanager().initialize(
+    callbackDispatcher,
+    isInDebugMode: true,
+  );
+
+  // ثبت کار دوره‌ای برای بررسی سرویس هر 15 دقیقه
+  await Workmanager().registerPeriodicTask(
+    "serviceChecker",
+    serviceCheckTask,
+    frequency: const Duration(minutes: 15),
+    constraints: Constraints(
+      networkType: NetworkType.not_required,
+      requiresBatteryNotLow: false,
+      requiresCharging: false,
+      requiresDeviceIdle: false,
+    ),
+  );
+
   runApp(const MyApp());
 }
 
@@ -260,6 +308,9 @@ class _AppListScreenState extends State<AppListScreen> {
     setState(() {
       _isLoading = true;
     });
+
+    // اطمینان از فعال بودن WorkManager برای بررسی‌های دوره‌ای
+    _ensurePeriodicWorkerRunning();
 
     // Always load apps first, even without usage permission
     await _loadAppsWithoutUsage();
@@ -796,8 +847,57 @@ class _AppListScreenState extends State<AppListScreen> {
       await _requestOverlayPermission();
     }
 
+    // درخواست دسترسی عدم بهینه‌سازی باتری
+    await _requestBatteryOptimizationPermission();
+
     // بررسی مجدد وضعیت سرویس‌ها
     await _checkServiceStatus();
+  }
+
+  // درخواست دسترسی عدم بهینه‌سازی باتری
+  Future<void> _requestBatteryOptimizationPermission() async {
+    try {
+      // بررسی وضعیت فعلی
+      final isIgnoringBatteryOptimizations = await _methodChannel
+          .invokeMethod('checkBatteryOptimizationPermission');
+
+      if (isIgnoringBatteryOptimizations != true) {
+        // نمایش دیالوگ پیش از درخواست
+        bool shouldRequest = await showDialog<bool>(
+              context: context,
+              barrierDismissible: false,
+              builder: (context) => AlertDialog(
+                title: const Text('بهینه‌سازی باتری'),
+                content: const Text(
+                  'برای اطمینان از عملکرد درست قفل برنامه‌ها، لطفاً مجوز "عدم بهینه‌سازی باتری" را فعال کنید.\n\n'
+                  'این به برنامه اجازه می‌دهد همیشه در پس‌زمینه فعال بماند.',
+                ),
+                actions: [
+                  TextButton(
+                    onPressed: () {
+                      Navigator.of(context).pop(false); // عدم درخواست
+                    },
+                    child: const Text('فعلاً نه'),
+                  ),
+                  ElevatedButton(
+                    onPressed: () {
+                      Navigator.of(context).pop(true); // درخواست
+                    },
+                    child: const Text('فعال کردن'),
+                  ),
+                ],
+              ),
+            ) ??
+            false;
+
+        if (shouldRequest) {
+          await _methodChannel
+              .invokeMethod('requestBatteryOptimizationPermission');
+        }
+      }
+    } catch (e) {
+      print("Error requesting battery optimization permission: $e");
+    }
   }
 
   // شروع سرویس مانیتورینگ در سمت اندروید
@@ -1653,6 +1753,28 @@ class _AppListScreenState extends State<AppListScreen> {
       });
     } catch (e) {
       print("Error getting current foreground app: $e");
+    }
+  }
+
+  // اطمینان از فعال بودن WorkManager
+  void _ensurePeriodicWorkerRunning() {
+    try {
+      // ثبت مجدد کار دوره‌ای برای بررسی سرویس هر 15 دقیقه
+      Workmanager().registerPeriodicTask(
+        "serviceChecker",
+        serviceCheckTask,
+        frequency: const Duration(minutes: 15),
+        constraints: Constraints(
+          networkType: NetworkType.not_required,
+          requiresBatteryNotLow: false,
+          requiresCharging: false,
+          requiresDeviceIdle: false,
+        ),
+        existingWorkPolicy: ExistingWorkPolicy.replace,
+      );
+      print("Registered periodic task for service checking");
+    } catch (e) {
+      print("Error registering WorkManager task: $e");
     }
   }
 }
