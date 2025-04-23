@@ -64,9 +64,13 @@ class AppLockOverlayActivity : Activity() {
         // تنظیم نمایش تمام صفحه و روی تمام برنامه‌ها
         window.setFlags(
             WindowManager.LayoutParams.FLAG_FULLSCREEN or 
-            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+            WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+            WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
             WindowManager.LayoutParams.FLAG_FULLSCREEN or 
-            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+            WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+            WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
         )
         
         // اطمینان از نمایش روی قفل صفحه و نمایش‌های دیگر
@@ -92,14 +96,18 @@ class AppLockOverlayActivity : Activity() {
         // ثبت کنیم که صفحه قفل در حال نمایش است
         isLockScreenShowing = true
         
-        // دریافت اطلاعات از intent
-        packageName = intent.getStringExtra(EXTRA_PACKAGE_NAME)
-        val appName = intent.getStringExtra(EXTRA_APP_NAME) ?: "این برنامه"
-        timeUsedMinutes = intent.getLongExtra(EXTRA_TIME_USED, 0)
-        timeLimitMinutes = intent.getLongExtra(EXTRA_TIME_LIMIT, 0)
+        // دریافت اطلاعات از intent - پشتیبانی از هر دو نوع کلید (با نام جدید و قدیمی)
+        packageName = intent.getStringExtra("packageName") ?: intent.getStringExtra(EXTRA_PACKAGE_NAME)
+        val appName = intent.getStringExtra("appName") ?: intent.getStringExtra(EXTRA_APP_NAME) ?: "این برنامه"
+        timeUsedMinutes = intent.getLongExtra("timeUsed", intent.getLongExtra(EXTRA_TIME_USED, 0))
+        timeLimitMinutes = intent.getLongExtra("timeLimit", intent.getLongExtra(EXTRA_TIME_LIMIT, 0))
+        val forceLock = intent.getBooleanExtra("forceLock", false)
         
         // دریافت پیش‌فرض‌ها
         prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        
+        // جلوگیری از بازگشت کاربر با دکمه بازگشت
+        setFinishOnTouchOutside(false)
         
         // initialize UI elements
         initializeUIElements()
@@ -110,8 +118,16 @@ class AppLockOverlayActivity : Activity() {
         // شروع بررسی دوره‌ای
         startLockChecker()
         
-        // برای اطمینان، یکبار دیگر برنامه قفل شده را بررسی و بلاک می‌کنیم
-        checkAndBlockApp()
+        // اطمینان از بسته بودن برنامه قفل شده
+        forceCloseLockedApp()
+        
+        // اگر حالت قفل اجباری است، تنظیم بیشتر روی این صفحه
+        if (forceLock) {
+            setupForceLockMode()
+        }
+        
+        // برای اطمینان، تنظیم یک تایمر برای بررسی‌های مکرر
+        setupPeriodicChecks()
     }
     
     private fun initializeUIElements() {
@@ -199,8 +215,14 @@ class AppLockOverlayActivity : Activity() {
     }
     
     override fun onBackPressed() {
-        // غیرفعال کردن دکمه‌ی بازگشت و جایگزینی با رفتن به صفحه اصلی
-        goToHomeScreen()
+        // محدود کردن تعداد فشار برای خروج
+        backPressCount++
+        Toast.makeText(this, "برای خروج از صفحه قفل، از دکمه 'بازگشت به صفحه اصلی' استفاده کنید", Toast.LENGTH_SHORT).show()
+        
+        // اگر بیش از 3 بار پشت سر هم بازگشت زد، به صفحه اصلی برود (برای جلوگیری از گیر کردن کاربر)
+        if (backPressCount >= 3) {
+            goToHomeScreen()
+        }
     }
 
     // متد جدید برای بررسی و مسدود کردن اپلیکیشن قفل شده
@@ -308,5 +330,72 @@ class AppLockOverlayActivity : Activity() {
             return true
         }
         return super.dispatchKeyEvent(event)
+    }
+    
+    // ایجاد حالت قفل اجباری با مقاومت بیشتر در برابر بستن
+    private fun setupForceLockMode() {
+        try {
+            // تغییر رنگ پس‌زمینه به قرمز برای تاکید بیشتر
+            rootView.setBackgroundColor(resources.getColor(android.R.color.holo_red_dark))
+            
+            // تغییر متن دکمه و عملکرد آن
+            btnReturnHome.text = "متوجه شدم، بازگشت به صفحه اصلی"
+            
+            // نمایش پیام واضح‌تر
+            txtMessage.text = "⚠️ محدودیت زمانی کاملاً به پایان رسیده است ⚠️\n\nامکان استفاده از این برنامه تا زمان آزاد شدن محدودیت وجود ندارد."
+            
+            // هشدار صوتی (اگر ممکن باشد)
+            try {
+                val notification = android.media.RingtoneManager.getDefaultUri(android.media.RingtoneManager.TYPE_NOTIFICATION)
+                val ringtone = android.media.RingtoneManager.getRingtone(applicationContext, notification)
+                ringtone.play()
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to play notification sound", e)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error setting up force lock mode", e)
+        }
+    }
+    
+    // راه‌اندازی بررسی‌های دوره‌ای برای اطمینان از بسته ماندن برنامه
+    private fun setupPeriodicChecks() {
+        val handler = Handler(Looper.getMainLooper())
+        handler.postDelayed(object : Runnable {
+            override fun run() {
+                forceCloseLockedApp()
+                handler.postDelayed(this, 1000) // هر ثانیه چک کن
+            }
+        }, 1000)
+    }
+    
+    // بستن اجباری برنامه قفل شده
+    private fun forceCloseLockedApp() {
+        if (packageName != null) {
+            try {
+                // بسته شدن برنامه از طریق ساختن Intent خانه
+                val homeIntent = Intent(Intent.ACTION_MAIN)
+                homeIntent.addCategory(Intent.CATEGORY_HOME)
+                homeIntent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                startActivity(homeIntent)
+                
+                // تلاش برای kill کردن پروسس برنامه
+                val am = getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+                am.killBackgroundProcesses(packageName)
+                
+                Log.d(TAG, "Force close attempted for $packageName")
+            } catch (e: Exception) {
+                Log.e(TAG, "Error force closing app", e)
+            }
+        }
+    }
+    
+    // جلوگیری از پردازش کلیدها
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        // همه کلیدها غیر از HOME و POWER را بلاک کن
+        return if (keyCode != KeyEvent.KEYCODE_HOME && keyCode != KeyEvent.KEYCODE_POWER) {
+            true
+        } else {
+            super.onKeyDown(keyCode, event)
+        }
     }
 } 
