@@ -332,6 +332,19 @@ class _AppListScreenState extends State<AppListScreen> {
         }
         _lastUpdateTime = DateTime.now();
       });
+
+      // اطمینان از اعمال قفل برای برنامه‌های قفل شده در شروع برنامه
+      try {
+        await _methodChannel.invokeMethod('ensureServiceRunning');
+        print("Service running check completed on app initialization");
+
+        // برای اطمینان از درست کار کردن قفل برنامه‌ها
+        await Future.delayed(const Duration(seconds: 2));
+        await _methodChannel.invokeMethod('enforceAppLocks');
+        print("App locks enforced on startup");
+      } catch (e) {
+        print("Error initializing app lock: $e");
+      }
     } else if (!_showingPermissionDialog) {
       // Only show permission dialog if we haven't shown it yet
       _showingPermissionDialog = true;
@@ -693,6 +706,15 @@ class _AppListScreenState extends State<AppListScreen> {
         }
       });
 
+      // ذخیره وضعیت دسترسی‌ها برای جلوگیری از درخواست مجدد
+      final prefs = await _prefs;
+      if (_hasAccessibilityPermission) {
+        await prefs.setBool('accessibility_permission_granted', true);
+      }
+      if (_hasOverlayPermission) {
+        await prefs.setBool('overlay_permission_granted', true);
+      }
+
       // اگر سرویس‌ها فعال هستند، مانیتورینگ را شروع کن
       if (_hasAccessibilityPermission &&
           _hasOverlayPermission &&
@@ -833,18 +855,23 @@ class _AppListScreenState extends State<AppListScreen> {
 
   // متد جدید برای درخواست دسترسی‌های مورد نیاز
   Future<void> _requestRequiredPermissions() async {
+    final prefs = await _prefs;
+    bool accessibilityGranted =
+        prefs.getBool('accessibility_permission_granted') ?? false;
+    bool overlayGranted = prefs.getBool('overlay_permission_granted') ?? false;
+
     // درخواست دسترسی usage stats
     if (!_hasUsagePermission) {
       await _requestUsagePermission();
     }
 
-    // درخواست دسترسی accessibility
-    if (!_hasAccessibilityPermission) {
+    // درخواست دسترسی accessibility فقط اگر قبلا فعال نشده باشد
+    if (!_hasAccessibilityPermission && !accessibilityGranted) {
       await _requestAccessibilityPermission();
     }
 
-    // درخواست دسترسی overlay اگر نیاز باشد
-    if (!_hasOverlayPermission) {
+    // درخواست دسترسی overlay فقط اگر قبلا فعال نشده باشد
+    if (!_hasOverlayPermission && !overlayGranted) {
       await _requestOverlayPermission();
     }
 

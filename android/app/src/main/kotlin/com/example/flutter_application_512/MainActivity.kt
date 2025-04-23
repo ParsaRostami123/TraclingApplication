@@ -31,6 +31,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.app.AlarmManager
 import android.app.PendingIntent
+import org.json.JSONArray
 
 class MainActivity: FlutterActivity() {
     private val CHANNEL = "com.example.flutter_application_512/usage_stats"
@@ -208,6 +209,15 @@ class MainActivity: FlutterActivity() {
                         unlockApp(packageName, result)
                     } else {
                         result.error("INVALID_ARGUMENTS", "Package name is required", null)
+                    }
+                }
+                "enforceAppLocks" -> {
+                    try {
+                        enforceAllAppLocks()
+                        result.success(true)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error enforcing app locks", e)
+                        result.error("ERROR", "Failed to enforce app locks", e.message)
                     }
                 }
                 else -> {
@@ -743,7 +753,7 @@ class MainActivity: FlutterActivity() {
         }
     }
 
-    private fun setAppTimeLimit(packageName: String, limitMinutes: Long, result: MethodChannel.Result) {
+    private fun setAppTimeLimit(packageName: String, limitMinutes: Long, result: MethodChannel.Result? = null) {
         try {
             val prefs = getSharedPreferences(AppLockAccessibilityService.PREFS_NAME, Context.MODE_PRIVATE)
             val timeLimitsJson = prefs.getString(AppLockAccessibilityService.TIME_LIMITS_KEY, "{}")
@@ -781,14 +791,14 @@ class MainActivity: FlutterActivity() {
                 // Start monitoring service
                 startMonitoringService()
                 
-                result.success(true)
+                result?.success(true)
             } else {
                 Log.e(TAG, "Failed to save time limit for $packageName")
-                result.error("SAVE_FAILED", "Could not save time limit for $packageName", null)
+                result?.error("SAVE_FAILED", "Could not save time limit for $packageName", null)
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error setting app time limit", e)
-            result.error("ERROR", "Failed to set app time limit: ${e.message}", null)
+            result?.error("ERROR", "Failed to set app time limit: ${e.message}", null)
         }
     }
 
@@ -1143,5 +1153,30 @@ class MainActivity: FlutterActivity() {
             return pm.isIgnoringBatteryOptimizations(packageName)
         }
         return false
+    }
+
+    // اعمال همه قفل‌های برنامه و مطمئن شدن از اینکه برنامه‌های قفل شده باز نیستند
+    private fun enforceAllAppLocks() {
+        try {
+            // دریافت لیست برنامه‌های قفل شده
+            val prefs = applicationContext.getSharedPreferences(AppLockAccessibilityService.PREFS_NAME, Context.MODE_PRIVATE)
+            val lockedAppsJson = prefs.getString(AppLockAccessibilityService.LOCKED_APPS_KEY, "[]")
+            val lockedApps = JSONArray(lockedAppsJson ?: "[]")
+
+            Log.d(TAG, "Enforcing locks for ${lockedApps.length()} apps")
+            
+            if (lockedApps.length() > 0) {
+                // ارسال درخواست به سرویس برای بررسی و اعمال قفل‌ها
+                val broadcastIntent = Intent(AppLockAccessibilityService.SERVICE_RESTART_ACTION)
+                broadcastIntent.putExtra("enforceLockedApps", true)
+                sendBroadcast(broadcastIntent)
+                
+                // همچنین برای اطمینان، سرویس را دوباره راه‌اندازی کنیم
+                ensureAccessibilityServiceRunning()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error enforcing app locks", e)
+            throw e
+        }
     }
 }

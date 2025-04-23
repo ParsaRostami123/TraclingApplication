@@ -46,19 +46,19 @@ class AppLockAccessibilityService : AccessibilityService() {
         const val LOCKED_APPS_KEY = "locked_apps"
         const val SERVICE_RESTART_ACTION = "com.example.flutter_application_512.RESTART_SERVICE"
         
-        // Reduced interval for more responsive locking
-        private const val CHECK_INTERVAL = 500L // Check every 500ms
+        // Reduced interval for more responsive locking - even faster now
+        private const val CHECK_INTERVAL = 300L // Check every 300ms
         
         // Static flag to track service running state
         var isServiceRunning = false
         
-        // DEBUG flag - should be disabled in production
+        // DEBUG flag - enabled for troubleshooting
         private const val DEBUG = true
     }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
-        Log.d(TAG, "Service connected")
+        Log.d(TAG, "🚀 Service connected - Enhanced Lock Mode Activated")
         isServiceRunning = true
         
         // Initialize preferences
@@ -89,9 +89,12 @@ class AppLockAccessibilityService : AccessibilityService() {
         // Report a heartbeat immediately to confirm service is running
         updateHeartbeat()
         
+        // Create a list of all tracked apps with time limits for debugging
+        logTrackedAppsWithLimits()
+        
         // Show toast only in debug mode
         if (DEBUG) {
-            Toast.makeText(this, "App Lock Service Started", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "سرویس قفل برنامه با حالت پیشرفته فعال شد", Toast.LENGTH_LONG).show()
         }
     }
     
@@ -110,6 +113,14 @@ class AppLockAccessibilityService : AccessibilityService() {
     }
     
     private fun registerAppLockReceiver() {
+        if (appLockReceiver != null) {
+            try {
+                unregisterReceiver(appLockReceiver)
+            } catch (e: Exception) {
+                // Already unregistered
+            }
+        }
+        
         appLockReceiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context, intent: Intent) {
                 when (intent.action) {
@@ -128,6 +139,13 @@ class AppLockAccessibilityService : AccessibilityService() {
                     }
                     SERVICE_RESTART_ACTION -> {
                         Log.d(TAG, "Received service restart request")
+                        
+                        // Check if we need to enforce locked apps
+                        if (intent.getBooleanExtra("enforceLockedApps", false)) {
+                            Log.d(TAG, "Received request to enforce all locked apps")
+                            enforceAllLockedApps()
+                        }
+                        
                         // No need to restart here since we're already running
                         // Just update the heartbeat to confirm we're active
                         updateHeartbeat()
@@ -188,9 +206,14 @@ class AppLockAccessibilityService : AccessibilityService() {
         if (runnable == null) {
             runnable = Runnable {
                 checkForegroundApp()
+                
+                // Additionally, verify against locked apps list more frequently
+                verifyNoLockedAppsRunning()
+                
                 handler.postDelayed(runnable!!, CHECK_INTERVAL)
             }
             handler.post(runnable!!)
+            Log.d(TAG, "Started periodic checks with interval: $CHECK_INTERVAL ms")
         }
     }
     
@@ -209,7 +232,24 @@ class AppLockAccessibilityService : AccessibilityService() {
             
             val packageName = event.packageName?.toString() ?: ""
             if (packageName.isNotEmpty() && packageName != "android" && !packageName.startsWith("com.android")) {
+                // Check if this app is locked regardless of switch
+                if (isAppLocked(packageName)) {
+                    Log.d(TAG, "⚠️ LOCKED APP DETECTED in accessibility event: $packageName")
+                    
+                    // Give detailed event info for debugging
+                    val eventText = event.text?.joinToString(", ") ?: "no text"
+                    val eventSource = event.source?.className ?: "unknown source"
+                    Log.d(TAG, "Event details - Type: ${event.eventType}, Text: $eventText, Source: $eventSource")
+                    
+                    performGoHomeAction()
+                    forceCloseApp(packageName)
+                    showLockScreen(packageName)
+                    return
+                }
+                
+                // Normal app switch handling
                 if (lastForegroundPackage != packageName) {
+                    Log.d(TAG, "📱 App switch detected: $lastForegroundPackage -> $packageName")
                     handleAppSwitch(packageName)
                 }
             }
@@ -261,6 +301,17 @@ class AppLockAccessibilityService : AccessibilityService() {
         isCheckingInProgress = true
         
         try {
+            // First verify no locked apps are running
+            val currentApp = getCurrentForegroundPackage()
+            if (currentApp != null && isAppLocked(currentApp)) {
+                Log.d(TAG, "🔒 Locked app detected during regular check: $currentApp")
+                performGoHomeAction()
+                forceCloseApp(currentApp)
+                showLockScreen(currentApp)
+                isCheckingInProgress = false
+                return
+            }
+            
             // Verify we have a recent event (within last 500ms) to ensure service is working
             val now = System.currentTimeMillis()
             val timeSinceLastEvent = now - lastEventTime
@@ -268,19 +319,23 @@ class AppLockAccessibilityService : AccessibilityService() {
             // If app is actively being used, update time
             if (lastForegroundPackage.isNotEmpty() && isAppTracked(lastForegroundPackage)) {
                 // Only count time if the service is actively detecting events and screen is on
-                if (timeSinceLastEvent < 500 && isScreenOn()) {
+                if (timeSinceLastEvent < 1000 && isScreenOn()) {
                     currentForegroundTime += CHECK_INTERVAL
                     
                     // Get current usage including current session
                     val totalUsageTime = currentDayUsage.getOrDefault(lastForegroundPackage, 0L) + currentForegroundTime
 
                     // Log usage time more frequently for apps close to their limits (Telegram fix)
-                    if (totalUsageTime % 5000 < CHECK_INTERVAL) {
+                    if (totalUsageTime % 3000 < CHECK_INTERVAL) {
                         Log.d(TAG, "⏱️ App usage: $lastForegroundPackage - ${totalUsageTime/1000}s (session: ${currentForegroundTime/1000}s)")
                     }
                     
                     // Check for time limit exceeded
                     checkTimeLimitExceeded(lastForegroundPackage, totalUsageTime)
+                } else {
+                    // If we haven't detected events in a while, try to update current foreground app
+                    Log.d(TAG, "No recent events for ${timeSinceLastEvent}ms, trying to update foreground app")
+                    verifyForegroundAppWithUsageStats()
                 }
             } else {
                 // Check if we're actually in another app that's not being detected through normal events
@@ -288,13 +343,13 @@ class AppLockAccessibilityService : AccessibilityService() {
                 verifyForegroundAppWithUsageStats()
             }
             
-            // Periodically update heartbeat (every 30 seconds)
-            if (now % 30000 < CHECK_INTERVAL) {
+            // Periodically update heartbeat (every 15 seconds)
+            if (now % 15000 < CHECK_INTERVAL) {
                 updateHeartbeat()
             }
             
-            // Save usage data more frequently (every 30 seconds)
-            if (now % 30000 < CHECK_INTERVAL) {
+            // Save usage data more frequently (every 15 seconds)
+            if (now % 15000 < CHECK_INTERVAL) {
                 saveUsageData()
             }
         } catch (e: Exception) {
@@ -361,33 +416,36 @@ class AppLockAccessibilityService : AccessibilityService() {
                         currentDayUsage[packageName] = totalUsageTime
                         saveUsageData()
                         
-                        // Lock the app
+                        // Lock the app - با تاکید بیشتر
                         lockApp(packageName)
                         
-                        // If currently in foreground, go home
+                        // If currently in foreground, go home immediately and forcefully
                         if (packageName == lastForegroundPackage) {
                             // Double-check that we're going home successfully
                             performGoHomeAction()
                             
-                            // Also try closing recent apps as a backup
+                            // Try multiple approaches to ensure app closes
+                            forceCloseApp(packageName)
+                            
+                            // Also show the lock screen after a short delay
                             handler.postDelayed({
-                                try {
-                                    performGlobalAction(GLOBAL_ACTION_RECENTS)
-                                    handler.postDelayed({
-                                        performGlobalAction(GLOBAL_ACTION_HOME)
-                                    }, 300)
-                                } catch (e: Exception) {
-                                    Log.e(TAG, "Error performing recents action", e)
-                                }
-                            }, 500)
+                                showLockScreen(packageName)
+                            }, 200)
+                        }
+                    } else {
+                        // App is already locked, but make sure it's not in foreground
+                        if (packageName == lastForegroundPackage) {
+                            Log.d(TAG, "App already locked but still in foreground: $packageName")
+                            performGoHomeAction()
+                            forceCloseApp(packageName)
                         }
                     }
                 }
                 // Alert when approaching limit (90%)
                 else if (totalUsageTime >= limitMs * 0.9 && 
                          totalUsageTime < limitMs && 
-                         totalUsageTime % 30000 < CHECK_INTERVAL) {
-                    // Show a warning every 30 seconds when close to limit
+                         totalUsageTime % 15000 < CHECK_INTERVAL) {
+                    // Show a warning more frequently (every 15 seconds) when close to limit
                     val timeLeftSeconds = (limitMs - totalUsageTime) / 1000
                     Log.d(TAG, "⚠️ Approaching time limit for $packageName: ${timeLeftSeconds}s left")
                     
@@ -398,7 +456,7 @@ class AppLockAccessibilityService : AccessibilityService() {
                                 val appName = getAppName(packageName)
                                 Toast.makeText(
                                     this, 
-                                    "$appName: ${timeLeftSeconds}s از زمان مجاز باقی مانده", 
+                                    "$appName: تنها ${timeLeftSeconds} ثانیه از زمان مجاز باقی مانده", 
                                     Toast.LENGTH_SHORT
                                 ).show()
                             } catch (e: Exception) {
@@ -413,6 +471,86 @@ class AppLockAccessibilityService : AccessibilityService() {
         }
     }
     
+    private fun verifyNoLockedAppsRunning() {
+        try {
+            // Get current foreground app using multiple methods to be extra sure
+            val currentApp = getCurrentForegroundPackage()
+            
+            if (currentApp != null && currentApp.isNotEmpty() && isAppLocked(currentApp)) {
+                Log.d(TAG, "🚨 CRITICAL: Locked app detected in foreground: $currentApp")
+                
+                // Close it immediately using all available methods
+                performGoHomeAction()
+                forceCloseApp(currentApp)
+                showLockScreen(currentApp)
+                
+                // Also broadcast an emergency notification
+                val intent = Intent("com.example.flutter_application_512.APP_LOCKED").apply {
+                    putExtra("packageName", currentApp)
+                    putExtra("emergency", true)
+                }
+                sendBroadcast(intent)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error in verifyNoLockedAppsRunning", e)
+        }
+    }
+    
+    private fun getCurrentForegroundPackage(): String? {
+        // Method 1: Use our tracked foreground package
+        if (lastForegroundPackage.isNotEmpty() && 
+            lastForegroundPackage != "android" && 
+            !lastForegroundPackage.startsWith("com.android")) {
+            return lastForegroundPackage
+        }
+        
+        // Method 2: Try to get from UsageStats
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
+            try {
+                val usm = usageManager ?: return null
+                val time = System.currentTimeMillis()
+                val events = usm.queryEvents(time - 5000, time)
+                val event = android.app.usage.UsageEvents.Event()
+                
+                var lastEventPackageName: String? = null
+                var lastEventTime = 0L
+                
+                while (events.hasNextEvent()) {
+                    events.getNextEvent(event)
+                    if (event.eventType == android.app.usage.UsageEvents.Event.MOVE_TO_FOREGROUND && 
+                        event.timeStamp > lastEventTime) {
+                        lastEventPackageName = event.packageName
+                        lastEventTime = event.timeStamp
+                    }
+                }
+                
+                if (lastEventPackageName != null && 
+                    lastEventPackageName != "android" && 
+                    !lastEventPackageName.startsWith("com.android")) {
+                    return lastEventPackageName
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error getting foreground app from UsageStats", e)
+            }
+        }
+        
+        // Method 3: Try using ActivityManager (less reliable on newer Android versions)
+        try {
+            val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            val tasks = am.getRunningTasks(1)
+            if (tasks.isNotEmpty() && tasks[0].topActivity != null) {
+                val packageName = tasks[0].topActivity!!.packageName
+                if (packageName != "android" && !packageName.startsWith("com.android")) {
+                    return packageName
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error getting foreground app from ActivityManager", e)
+        }
+        
+        return null
+    }
+    
     private fun checkAndLockApp(packageName: String) {
         // Skip system packages and non-tracked apps
         if (packageName.isEmpty() || packageName == "android" || 
@@ -421,13 +559,28 @@ class AppLockAccessibilityService : AccessibilityService() {
         }
         
         try {
-            // First check if app is already locked
+            // First check if app is already locked - اگر برنامه قفل باشد باید بلافاصله بسته شود
             if (isAppLocked(packageName)) {
-                Log.d(TAG, "$packageName is locked, returning to home")
-                performGoHomeAction()
+                Log.d(TAG, "🔥 $packageName is locked, enforcing closure and returning to home")
                 
-                // Show lock screen
-                showLockScreen(packageName)
+                // Multiple attempts to enforce the closure
+                performGoHomeAction()
+                forceCloseApp(packageName)
+                
+                // Show lock screen with slight delay to ensure home action completes first
+                handler.postDelayed({
+                    showLockScreen(packageName)
+                    
+                    // Double-check after a short delay that we're not still in the app
+                    handler.postDelayed({
+                        if (getCurrentForegroundPackage() == packageName) {
+                            Log.d(TAG, "⚠️ App still in foreground after lock attempt, trying again: $packageName")
+                            performGoHomeAction()
+                            forceCloseApp(packageName)
+                        }
+                    }, 500)
+                }, 200)
+                
                 return
             }
             
@@ -439,14 +592,38 @@ class AppLockAccessibilityService : AccessibilityService() {
                 val limitMinutes = timeLimits.getLong(packageName)
                 val limitMs = limitMinutes * 60 * 1000
                 
-                // Get current usage from our tracking map
-                val usageTime = currentDayUsage.getOrDefault(packageName, 0L)
+                // Get current usage including current session to avoid any delays
+                val currentSessionTime = if (packageName == lastForegroundPackage) currentForegroundTime else 0
+                val totalUsageTime = currentDayUsage.getOrDefault(packageName, 0L) + currentSessionTime
+                
+                // Log time limit status for debugging
+                Log.d(TAG, "Checking time limit for $packageName: used ${totalUsageTime/1000}s of ${limitMs/1000}s limit")
                 
                 // If already over limit, lock app
-                if (usageTime >= limitMs) {
-                    Log.d(TAG, "Time limit already exceeded for $packageName")
+                if (totalUsageTime >= limitMs) {
+                    Log.d(TAG, "🔒 Time limit exceeded for $packageName: ${totalUsageTime/1000}s >= ${limitMs/1000}s")
+                    
+                    // Lock the app IMMEDIATELY
                     lockApp(packageName)
+                    
+                    // Multiple enforcement actions
                     performGoHomeAction()
+                    forceCloseApp(packageName)
+                    
+                    // Show lock screen with slight delay
+                    handler.postDelayed({
+                        showLockScreen(packageName)
+                        
+                        // Double check the app is actually closed
+                        handler.postDelayed({
+                            val current = getCurrentForegroundPackage()
+                            if (current == packageName) {
+                                Log.d(TAG, "⚠️ App still in foreground after locking, forcing closure again: $packageName")
+                                performGoHomeAction()
+                                forceCloseApp(packageName)
+                            }
+                        }, 500)
+                    }, 300)
                 }
             }
         } catch (e: Exception) {
@@ -497,7 +674,13 @@ class AppLockAccessibilityService : AccessibilityService() {
             // Check if already locked to avoid duplicates
             for (i in 0 until lockedApps.length()) {
                 if (lockedApps.getString(i) == packageName) {
-                    // Already locked
+                    // Already locked - make sure it's closed if in foreground
+                    Log.d(TAG, "App already locked: $packageName - enforcing closure")
+                    if (packageName == lastForegroundPackage || getCurrentForegroundPackage() == packageName) {
+                        performGoHomeAction()
+                        forceCloseApp(packageName)
+                        showLockScreen(packageName)
+                    }
                     return
                 }
             }
@@ -506,44 +689,38 @@ class AppLockAccessibilityService : AccessibilityService() {
             lockedApps.put(packageName)
             prefs.edit().putString(LOCKED_APPS_KEY, lockedApps.toString()).apply()
             
+            // Log the updated locked apps list
+            Log.d(TAG, "🔒 UPDATED LOCKED APPS LIST: ${lockedApps.toString()}")
+            
             // Broadcast that app is locked
             val intent = Intent("com.example.flutter_application_512.APP_LOCKED").apply {
                 putExtra("packageName", packageName)
             }
             sendBroadcast(intent)
             
-            Log.d(TAG, "🔒 Locked app: $packageName")
+            Log.d(TAG, "🔒🔒🔒 LOCKED APP: $packageName 🔒🔒🔒")
             
-            // Show notification to user
-            handler.post {
-                try {
-                    val appName = getAppName(packageName)
-                    Toast.makeText(this, "زمان استفاده از $appName به پایان رسید", Toast.LENGTH_LONG).show()
-                } catch (e: Exception) {
-                    // Ignore errors in toast display
-                }
-            }
-            
-            // Special handling for problematic apps (e.g., Telegram)
-            if (packageName == "org.telegram.messenger" || 
-                packageName == "com.whatsapp" || 
-                packageName == "com.instagram.android") {
+            // If app is in foreground, force it to close
+            if (packageName == lastForegroundPackage || getCurrentForegroundPackage() == packageName) {
+                Log.d(TAG, "Locked app is in foreground, forcing closure")
+                performGoHomeAction()
+                forceCloseApp(packageName)
                 
-                // Force-close recent apps and return to home
+                // Show lock screen
                 handler.postDelayed({
-                    try {
-                        performGlobalAction(GLOBAL_ACTION_RECENTS)
-                        handler.postDelayed({
-                            performGlobalAction(GLOBAL_ACTION_HOME)
-                        }, 300)
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Error forcing app closure", e)
+                    showLockScreen(packageName)
+                }, 200)
+                
+                // Perform a second check after a delay to make sure app is really closed
+                handler.postDelayed({
+                    if (getCurrentForegroundPackage() == packageName) {
+                        Log.d(TAG, "App still in foreground after locking, forcing closure again")
+                        performGoHomeAction()
+                        forceCloseApp(packageName)
+                        showLockScreen(packageName)
                     }
-                }, 300)
+                }, 800)
             }
-            
-            // نمایش صفحه قفل با استفاده از متد showLockScreen
-            showLockScreen(packageName)
         } catch (e: Exception) {
             Log.e(TAG, "Error locking app", e)
         }
@@ -551,41 +728,78 @@ class AppLockAccessibilityService : AccessibilityService() {
     
     private fun showLockScreen(packageName: String) {
         try {
-            if (AppLockOverlayActivity.isLockScreenShowing) {
-                Log.d(TAG, "Lock screen is already showing, not showing again for $packageName")
+            // Ensure we're showing lock screen for a tracked app
+            if (!isAppTracked(packageName)) {
+                Log.d(TAG, "Attempted to show lock screen for non-tracked app: $packageName")
                 return
             }
             
-            // اطلاعات برنامه را دریافت می‌کنیم
-            val appName = getAppName(packageName)
-            
-            // دریافت اطلاعات زمان استفاده و محدودیت
+            // Getting time used and time limit information
             val timeLimitsJson = prefs.getString(TIME_LIMITS_KEY, "{}")
             val timeLimits = JSONObject(timeLimitsJson ?: "{}")
+            val usageDataJson = prefs.getString(APP_USAGE_DATA_KEY, "{}")
+            val usageData = JSONObject(usageDataJson ?: "{}")
             
-            var timeLimitMinutes = 0L
+            val appName = getAppName(packageName)
+            var timeUsedMinutes: Long = 0
+            var timeLimitMinutes: Long = 0
+            
+            if (usageData.has(packageName)) {
+                timeUsedMinutes = usageData.getLong(packageName) / (60 * 1000)
+            }
+            
             if (timeLimits.has(packageName)) {
                 timeLimitMinutes = timeLimits.getLong(packageName)
             }
             
-            val usageMs = currentDayUsage.getOrDefault(packageName, 0L)
-            val usageMinutes = usageMs / (60 * 1000)
-            
-            // ایجاد Intent برای نمایش Activity قفل
-            val lockIntent = Intent(this, AppLockOverlayActivity::class.java).apply {
-                flags = Intent.FLAG_ACTIVITY_NEW_TASK or 
-                        Intent.FLAG_ACTIVITY_CLEAR_TOP or
-                        Intent.FLAG_ACTIVITY_NO_HISTORY
-                putExtra(AppLockOverlayActivity.EXTRA_PACKAGE_NAME, packageName)
-                putExtra(AppLockOverlayActivity.EXTRA_APP_NAME, appName)
-                putExtra(AppLockOverlayActivity.EXTRA_TIME_USED, usageMinutes)
-                putExtra(AppLockOverlayActivity.EXTRA_TIME_LIMIT, timeLimitMinutes)
+            // Ensure we're not in our own app before showing lock screen
+            val currentApp = getCurrentForegroundPackage()
+            if (currentApp == packageName) {
+                // First send the user home
+                performGoHomeAction()
+                
+                // Wait a moment before showing overlay
+                handler.postDelayed({
+                    // Launch overlay activity
+                    val lockIntent = Intent(this, AppLockOverlayActivity::class.java).apply {
+                        flags = Intent.FLAG_ACTIVITY_NEW_TASK or 
+                                Intent.FLAG_ACTIVITY_CLEAR_TASK or
+                                Intent.FLAG_ACTIVITY_NO_ANIMATION
+                        putExtra("packageName", packageName)
+                        putExtra("appName", appName)
+                        putExtra("timeUsed", timeUsedMinutes)
+                        putExtra("timeLimit", timeLimitMinutes)
+                    }
+                    startActivity(lockIntent)
+                    
+                    // Extra safety check - make sure app is really closed
+                    handler.postDelayed({
+                        val appStillForeground = getCurrentForegroundPackage() == packageName
+                        if (appStillForeground) {
+                            Log.d(TAG, "App still detected after showing lock screen, forcing home again")
+                            performGoHomeAction()
+                            forceCloseApp(packageName)
+                            
+                            // Try showing lock screen again
+                            handler.postDelayed({
+                                startActivity(lockIntent)
+                            }, 200)
+                        }
+                    }, 500)
+                }, 200)
+            } else {
+                // App is not in foreground, still show lock screen for awareness
+                val lockIntent = Intent(this, AppLockOverlayActivity::class.java).apply {
+                    flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                    putExtra("packageName", packageName)
+                    putExtra("appName", appName)
+                    putExtra("timeUsed", timeUsedMinutes)
+                    putExtra("timeLimit", timeLimitMinutes)
+                }
+                startActivity(lockIntent)
             }
             
-            // نمایش اکتیویتی
-            startActivity(lockIntent)
-            
-            Log.d(TAG, "Showing lock screen for $packageName")
+            Log.d(TAG, "Lock screen shown for $packageName (${appName})")
         } catch (e: Exception) {
             Log.e(TAG, "Error showing lock screen", e)
         }
@@ -648,6 +862,113 @@ class AppLockAccessibilityService : AccessibilityService() {
             prefs.edit().putLong("last_heartbeat", System.currentTimeMillis()).apply()
         } catch (e: Exception) {
             Log.e(TAG, "Error updating heartbeat", e)
+        }
+    }
+    
+    private fun logTrackedAppsWithLimits() {
+        try {
+            val trackingAppsJson = prefs.getString(TRACKING_APPS_KEY, "[]")
+            val trackingApps = JSONArray(trackingAppsJson ?: "[]")
+            
+            val timeLimitsJson = prefs.getString(TIME_LIMITS_KEY, "{}")
+            val timeLimits = JSONObject(timeLimitsJson ?: "{}")
+            
+            Log.d(TAG, "📊 === Tracked Apps Configuration ===")
+            for (i in 0 until trackingApps.length()) {
+                val packageName = trackingApps.getString(i)
+                val appName = getAppName(packageName)
+                val limitMinutes = if (timeLimits.has(packageName)) timeLimits.getLong(packageName) else 0
+                val usage = currentDayUsage.getOrDefault(packageName, 0L) / (60 * 1000)
+                
+                Log.d(TAG, "📱 App: $appName ($packageName) | Limit: $limitMinutes min | Used: $usage min")
+            }
+            Log.d(TAG, "📊 ==============================")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error logging tracked apps", e)
+        }
+    }
+    
+    private fun forceCloseApp(packageName: String) {
+        try {
+            // Method 1: Most direct way, but requires permissions
+            val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            am.killBackgroundProcesses(packageName)
+            
+            // Method 2: Force the user back to home screen
+            performGoHomeAction()
+            
+            // Method 3: Use accessibility action to go back multiple times rapidly
+            // This can help exit from deep navigation within apps
+            for (i in 0 until 3) {
+                handler.postDelayed({
+                    try {
+                        performGlobalAction(GLOBAL_ACTION_BACK)
+                    } catch (e: Exception) {
+                        // Ignore
+                    }
+                }, i * 100L)
+            }
+            
+            // Method 4: Try to use recents menu and then home as a final measure
+            handler.postDelayed({
+                try {
+                    performGlobalAction(GLOBAL_ACTION_RECENTS)
+                    handler.postDelayed({
+                        performGlobalAction(GLOBAL_ACTION_HOME)
+                    }, 200)
+                } catch (e: Exception) {
+                    // Ignore
+                }
+            }, 300)
+            
+            Log.d(TAG, "Multiple methods used to force close: $packageName")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error force-closing app", e)
+        }
+    }
+    
+    // بررسی و اعمال قفل برای تمام برنامه‌های قفل شده
+    private fun enforceAllLockedApps() {
+        try {
+            // Get the current foreground app
+            val currentApp = getCurrentForegroundPackage()
+            
+            // Get list of locked apps
+            val lockedAppsJson = prefs.getString(LOCKED_APPS_KEY, "[]")
+            val lockedApps = JSONArray(lockedAppsJson ?: "[]")
+            
+            Log.d(TAG, "Enforcing locks for ${lockedApps.length()} apps")
+            
+            // Check if current foreground app is locked
+            var currentAppIsLocked = false
+            
+            for (i in 0 until lockedApps.length()) {
+                val lockedPackage = lockedApps.getString(i)
+                
+                // If current app is locked, enforce it
+                if (currentApp == lockedPackage) {
+                    currentAppIsLocked = true
+                    Log.d(TAG, "Current foreground app $lockedPackage is locked - enforcing closure")
+                    
+                    // Use all available methods to close it
+                    performGoHomeAction()
+                    forceCloseApp(lockedPackage)
+                    
+                    // Show lock screen with delay to ensure we're back at home
+                    handler.postDelayed({
+                        showLockScreen(lockedPackage)
+                    }, 500)
+                }
+            }
+            
+            // If no locked app is currently in foreground, still do a verification
+            if (!currentAppIsLocked) {
+                Log.d(TAG, "No locked apps are currently in foreground")
+                verifyNoLockedAppsRunning()
+            }
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error enforcing locked apps", e)
         }
     }
     
