@@ -1,632 +1,551 @@
 package com.example.flutter_application_512
 
 import android.accessibilityservice.AccessibilityService
-import android.content.Intent
-import android.content.SharedPreferences
-import android.util.Log
-import android.view.accessibility.AccessibilityEvent
-import android.view.accessibility.AccessibilityNodeInfo
+import android.accessibilityservice.AccessibilityServiceInfo
+import android.app.ActivityManager
+import android.app.KeyguardManager
+import android.app.usage.UsageStatsManager
+import android.content.BroadcastReceiver
 import android.content.Context
-import org.json.JSONObject
-import org.json.JSONArray
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.SharedPreferences
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
-import android.os.Build
-import android.content.BroadcastReceiver
-import android.content.IntentFilter
-import android.app.AlarmManager
-import android.app.PendingIntent
+import android.os.PowerManager
+import android.util.Log
+import android.view.accessibility.AccessibilityEvent
 import android.widget.Toast
+import org.json.JSONArray
+import org.json.JSONObject
+import java.util.concurrent.ConcurrentHashMap
 
 class AppLockAccessibilityService : AccessibilityService() {
     
-    private val TAG = "AppLockAccessibilityService"
     private lateinit var prefs: SharedPreferences
-    private var currentForegroundApp: String? = null
-    private var appStartTime: Long = 0
     private val handler = Handler(Looper.getMainLooper())
-    private var checkingRunnable: Runnable? = null
-    private var serviceStatusReceiver: BroadcastReceiver? = null
-    private var heartbeatRunnable: Runnable? = null
-    private val usageTimes = HashMap<String, Long>()
-    private var broadcastReceiver: BroadcastReceiver? = null
+    private var runnable: Runnable? = null
+    private var lastForegroundPackage: String = ""
+    private var lastAppSwitchTime: Long = 0
+    private var lastEventTime: Long = 0
+    private val timeBeforeConsideringNewApp = 1500L // 1.5 seconds threshold for genuine app switch
+    private var isCheckingInProgress = false
+    private var currentForegroundTime: Long = 0
+    private var usageManager: UsageStatsManager? = null
+    private val currentDayUsage = ConcurrentHashMap<String, Long>() // Thread-safe map
+    private var appLockReceiver: BroadcastReceiver? = null
+    private val TAG = "AppLockService"
     
     companion object {
         const val PREFS_NAME = "AppLockPrefs"
-        const val TIME_LIMITS_KEY = "app_time_limits"
+        const val TRACKING_APPS_KEY = "tracking_apps"
+        const val TIME_LIMITS_KEY = "time_limits"
         const val APP_USAGE_DATA_KEY = "app_usage_data"
-        const val CHECK_INTERVAL = 1000L // 1 second
-        const val HEARTBEAT_INTERVAL = 30000L // هر 30 ثانیه یکبار
-        const val SERVICE_RESTART_ACTION = "com.example.flutter_application_512.RESTART_ACCESSIBILITY_SERVICE"
+        const val LOCKED_APPS_KEY = "locked_apps"
+        const val SERVICE_RESTART_ACTION = "com.example.flutter_application_512.RESTART_SERVICE"
         
-        // Track if service is running
+        // Reduced interval for more responsive locking
+        private const val CHECK_INTERVAL = 500L // Check every 500ms
+        
+        // Static flag to track service running state
         var isServiceRunning = false
-    }
-    
-    override fun onCreate() {
-        super.onCreate()
-        Log.d(TAG, "AppLockAccessibilityService created")
-        prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        isServiceRunning = true
         
-        // ثبت وضعیت فعال سرویس
-        prefs.edit()
-            .putBoolean("accessibility_service_active", true)
-            .putLong("accessibility_service_created_at", System.currentTimeMillis())
-            .apply()
-        
-        // شروع بررسی سلامت سرویس
-        startHeartbeat()
-        
-        // ثبت گیرنده برای درخواست‌های راه‌اندازی مجدد
-        registerServiceRestartReceiver()
-
-        // ثبت heartbeat اولیه
-        sendHeartbeat()
-    }
-    
-    private fun startHeartbeat() {
-        heartbeatRunnable = Runnable {
-            // ثبت heartbeat
-            sendHeartbeat()
-            
-            // برنامه‌ریزی بررسی بعدی
-            handler.postDelayed(heartbeatRunnable!!, HEARTBEAT_INTERVAL)
-            
-            Log.d(TAG, "Accessibility service heartbeat sent")
-        }
-        
-        // شروع اولین بررسی
-        handler.post(heartbeatRunnable!!)
+        // DEBUG flag - should be disabled in production
+        private const val DEBUG = true
     }
 
-    private fun sendHeartbeat() {
-        try {
-            // ثبت آخرین زمان فعالیت سرویس
-            prefs.edit()
-                .putLong("accessibility_service_last_heartbeat", System.currentTimeMillis())
-                .putBoolean("accessibility_service_active", true)
-                .apply()
-                
-            // Broadcast heartbeat for any receivers that might be listening
-            val heartbeatIntent = Intent("com.example.flutter_application_512.ACCESSIBILITY_HEARTBEAT")
-            sendBroadcast(heartbeatIntent)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error sending heartbeat", e)
-        }
-    }
-    
-    private fun registerServiceRestartReceiver() {
-        try {
-            serviceStatusReceiver = object : BroadcastReceiver() {
-                override fun onReceive(context: Context, intent: Intent) {
-                    if (intent.action == SERVICE_RESTART_ACTION) {
-                        Log.d(TAG, "Received restart request for accessibility service")
-                        
-                        // تلاش برای راه‌اندازی مجدد اگر نیاز باشد
-                        if (!isServiceRunning) {
-                            Log.d(TAG, "Service not running, trying to restart")
-                            
-                            // اگر سرویس غیرفعال شده باشد، کاربر باید به تنظیمات دسترسی‌پذیری برود
-                            val accessibilityIntent = Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS)
-                            accessibilityIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                            context.startActivity(accessibilityIntent)
-                            
-                            // نمایش هشدار به کاربر
-                            val toastMessage = "سرویس قفل برنامه‌ها متوقف شده است. لطفاً دوباره آن را فعال کنید."
-                            android.widget.Toast.makeText(context, toastMessage, android.widget.Toast.LENGTH_LONG).show()
-                        } else {
-                            // If service is running, send a fresh heartbeat
-                            sendHeartbeat()
-                            Log.d(TAG, "Service is running, sent new heartbeat")
-                        }
-                    }
-                }
-            }
-            
-            val filter = IntentFilter().apply {
-                addAction(SERVICE_RESTART_ACTION)
-                addAction(Intent.ACTION_SCREEN_ON)
-            }
-            registerReceiver(serviceStatusReceiver, filter)
-            Log.d(TAG, "Service restart receiver registered successfully")
-        } catch (e: Exception) {
-            Log.e(TAG, "Error registering service restart receiver", e)
-        }
-    }
-    
-    private fun stopHeartbeat() {
-        heartbeatRunnable?.let {
-            handler.removeCallbacks(it)
-            heartbeatRunnable = null
-        }
-        Log.d(TAG, "Heartbeat monitoring stopped")
-    }
-    
-    override fun onUnbind(intent: Intent?): Boolean {
-        // چون onUnbind وقتی اتفاق می‌افتد که سرویس قصد دارد غیرفعال شود،
-        // اینجا مناسب است که تلاش کنیم بلافاصله آن را دوباره راه‌اندازی کنیم
-        Log.d(TAG, "Accessibility service is being unbound")
-        
-        // ثبت وضعیت غیرفعال سرویس
-        prefs.edit().putBoolean("accessibility_service_active", false).apply()
-        
-        // تلاش برای راه‌اندازی مجدد خودکار سرویس (اگر کاربر بخواهد)
-        if (prefs.getBoolean("auto_restart_service", true)) {
-            scheduleServiceRestart()
-        }
-        
-        // برای اینکه سیستم سعی کند سرویس را دوباره پیوند بزند
-        return true // super.onUnbind(intent)
-    }
-
-    private fun scheduleServiceRestart() {
-        try {
-            handler.postDelayed({
-                Log.d(TAG, "Attempting to restart accessibility service")
-                val restartIntent = Intent(ServiceRestartReceiver.ACTION_RESTART_ACCESSIBILITY)
-                sendBroadcast(restartIntent)
-            }, 1000)
-
-            // Schedule another restart after a longer delay for extra reliability
-            val restartIntent = Intent(this, ServiceRestartReceiver::class.java)
-            restartIntent.action = ServiceRestartReceiver.ACTION_RESTART_ACCESSIBILITY
-            
-            val pendingIntent = PendingIntent.getBroadcast(
-                this, 
-                0, 
-                restartIntent, 
-                PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE
-            )
-            
-            val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
-            
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                alarmManager.setExactAndAllowWhileIdle(
-                    AlarmManager.RTC_WAKEUP,
-                    System.currentTimeMillis() + 5000, // 5 seconds
-                    pendingIntent
-                )
-            } else {
-                alarmManager.set(
-                    AlarmManager.RTC_WAKEUP,
-                    System.currentTimeMillis() + 5000,
-                    pendingIntent
-                )
-            }
-            
-            Log.d(TAG, "Scheduled service restart in 5 seconds")
-        } catch (e: Exception) {
-            Log.e(TAG, "Error scheduling service restart", e)
-        }
-    }
-    
-    override fun onInterrupt() {
-        Log.d(TAG, "AppLockAccessibilityService interrupted")
-    }
-    
-    override fun onDestroy() {
-        super.onDestroy()
-        Log.d(TAG, "AppLockAccessibilityService destroyed")
-        isServiceRunning = false
-        
-        // ثبت وضعیت غیرفعال سرویس
-        prefs.edit().putBoolean("accessibility_service_active", false).apply()
-        
-        // توقف تمام تایمرها
-        stopPeriodicChecking()
-        stopHeartbeat()
-        
-        // لغو ثبت گیرنده
-        serviceStatusReceiver?.let {
-            try {
-                unregisterReceiver(it)
-                serviceStatusReceiver = null
-            } catch (e: Exception) {
-                Log.e(TAG, "Error unregistering receiver", e)
-            }
-        }
-        
-        // برنامه‌ریزی راه‌اندازی مجدد سرویس (اگر کاربر بخواهد)
-        if (prefs.getBoolean("auto_restart_service", true)) {
-            try {
-                val restartIntent = Intent(SERVICE_RESTART_ACTION)
-                val pendingIntent = PendingIntent.getBroadcast(this, 0, restartIntent,
-                    PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE)
-                
-                val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                    alarmManager.setExactAndAllowWhileIdle(
-                        AlarmManager.RTC_WAKEUP,
-                        System.currentTimeMillis() + 5000,
-                        pendingIntent
-                    )
-                } else {
-                    alarmManager.set(
-                        AlarmManager.RTC_WAKEUP,
-                        System.currentTimeMillis() + 5000,
-                        pendingIntent
-                    )
-                }
-                
-                Log.d(TAG, "Scheduled service restart in 5 seconds")
-            } catch (e: Exception) {
-                Log.e(TAG, "Error scheduling service restart", e)
-            }
-        }
-        
-        // لغو ثبت براودکست ریسیور
-        if (broadcastReceiver != null) {
-            try {
-                unregisterReceiver(broadcastReceiver)
-                Log.d(TAG, "Broadcast receiver unregistered")
-            } catch (e: Exception) {
-                Log.e(TAG, "Error unregistering broadcast receiver", e)
-            }
-        }
-    }
-    
     override fun onServiceConnected() {
         super.onServiceConnected()
-        Log.d(TAG, "AppLockAccessibilityService connected")
-        
-        // ثبت وضعیت فعال سرویس
+        Log.d(TAG, "Service connected")
         isServiceRunning = true
-        prefs.edit()
-            .putBoolean("accessibility_service_active", true)
-            .putLong("accessibility_service_connected_at", System.currentTimeMillis())
-            .apply()
         
-        // اطمینان از غیرفعال بودن حالت touch exploration
-        try {
-            val am = getSystemService(Context.ACCESSIBILITY_SERVICE) as android.view.accessibility.AccessibilityManager
-            if (am.isTouchExplorationEnabled) {
-                Log.d(TAG, "Touch exploration is enabled, trying to disable it")
-                // ما نمی‌توانیم مستقیماً غیرفعال کنیم، اما می‌توانیم به کاربر اطلاع دهیم
-                Handler(Looper.getMainLooper()).post {
-                    Toast.makeText(
-                        this,
-                        "برای عملکرد بهتر لمس، سرویس را غیرفعال و دوباره فعال کنید",
-                        Toast.LENGTH_LONG
-                    ).show()
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error checking touch exploration mode", e)
+        // Initialize preferences
+        prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        
+        // Record service start time
+        prefs.edit().putLong("service_start_time", System.currentTimeMillis()).apply()
+        
+        // Initialize usage stats manager
+        usageManager = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
+            getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
+        } else {
+            null
         }
         
-        // ارسال heartbeat جدید
-        sendHeartbeat()
+        // Load current usage data
+        loadUsageData()
         
-        // بررسی اولیه برنامه‌های در حال اجرا
-        handler.postDelayed({
-            // اگر برنامه‌ای در حال اجراست، آن را بررسی کنیم
-            val currentApp = getCurrentForegroundApp()
-            if (currentApp != null && isAppLocked(currentApp)) {
-                Log.d(TAG, "Found locked app running on service connection: $currentApp")
-                performGlobalAction(GLOBAL_ACTION_HOME)
-                handler.postDelayed({
-                    showLockScreen(currentApp)
-                }, 100)
-            }
-        }, 1000)
+        // Configure service
+        configureService()
         
-        // ثبت براودکست ریسیور برای دریافت رویدادهای مربوط به تنظیم محدودیت زمانی
-        registerBroadcastReceiver()
+        // Register broadcast receiver for app lock/unlock events
+        registerAppLockReceiver()
         
-        // Start the foreground service to ensure continuing reliability
-        try {
-            val serviceIntent = Intent(this, AppLockForegroundService::class.java)
-            serviceIntent.action = AppLockForegroundService.ACTION_START_SERVICE
-            
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                startForegroundService(serviceIntent)
-            } else {
-                startService(serviceIntent)
-            }
-            
-            Log.d(TAG, "Started AppLockForegroundService from Accessibility Service")
-        } catch (e: Exception) {
-            Log.e(TAG, "Error starting foreground service from accessibility service", e)
+        // Start periodic checks
+        startPeriodicChecks()
+        
+        // Report a heartbeat immediately to confirm service is running
+        updateHeartbeat()
+        
+        // Show toast only in debug mode
+        if (DEBUG) {
+            Toast.makeText(this, "App Lock Service Started", Toast.LENGTH_SHORT).show()
         }
     }
     
-    // دریافت برنامه فعلی در فورگراند
-    private fun getCurrentForegroundApp(): String? {
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                val usageStatsManager = getSystemService(Context.USAGE_STATS_SERVICE) as android.app.usage.UsageStatsManager
-                val time = System.currentTimeMillis()
-                
-                // بررسی 3 ثانیه اخیر
-                val usageEvents = usageStatsManager.queryEvents(time - 3000, time)
-                val event = android.app.usage.UsageEvents.Event()
-                
-                // بررسی آخرین برنامه فعال شده
-                var lastForegroundApp: String? = null
-                var lastEventTime = 0L
-                
-                while (usageEvents.hasNextEvent()) {
-                    usageEvents.getNextEvent(event)
-                    if (event.eventType == android.app.usage.UsageEvents.Event.MOVE_TO_FOREGROUND && 
-                        event.timeStamp > lastEventTime) {
-                        lastForegroundApp = event.packageName
-                        lastEventTime = event.timeStamp
-                    }
-                }
-                
-                return lastForegroundApp
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error getting current foreground app", e)
+    private fun configureService() {
+        val info = serviceInfo ?: AccessibilityServiceInfo()
+        info.apply {
+            eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or 
+                        AccessibilityEvent.TYPE_WINDOWS_CHANGED or
+                        AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
+            feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
+            flags = AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS or
+                    AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS
+            notificationTimeout = 100 // Make notifications faster
         }
-        
-        return null
+        serviceInfo = info
     }
     
-    private fun resetAppUsageData() {
-        try {
-            prefs.edit().putString(APP_USAGE_DATA_KEY, "{}").apply()
-            Log.d(TAG, "Reset all app usage data on service start")
-        } catch (e: Exception) {
-            Log.e(TAG, "Error resetting app usage data", e)
-        }
-    }
-
-    override fun onAccessibilityEvent(event: AccessibilityEvent) {
-        try {
-            // فقط به رویدادهای تغییر وضعیت پنجره توجه می‌کنیم
-            if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-                val packageName = event.packageName?.toString()
-                
-                // فیلتر کردن پکیج‌های سیستمی که نباید مسدود شوند
-                if (packageName != null && 
-                    packageName != "com.example.flutter_application_512" && 
-                    packageName != "android" && 
-                    !packageName.startsWith("com.android.systemui")) {
-                    
-                    Log.d(TAG, "Window state changed to: $packageName")
-                    
-                    // **مرحله 1: بررسی فوری قفل بودن اپلیکیشن**
-                    if (isAppLocked(packageName)) {
-                        Log.d(TAG, "BLOCKING APP: $packageName is locked!")
+    private fun registerAppLockReceiver() {
+        appLockReceiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                when (intent.action) {
+                    "com.example.flutter_application_512.APP_LOCKED" -> {
+                        val packageName = intent.getStringExtra("packageName")
+                        Log.d(TAG, "Received lock notification for: $packageName")
                         
-                        // فوراً به هوم اسکرین بازمی‌گردیم - حتی قبل از اینکه اپ فرصت نمایش پیدا کند
-                        performGlobalAction(GLOBAL_ACTION_HOME)
-                        
-                        // برای اطمینان چند بار این کار را انجام می‌دهیم
-                        for (i in 1..2) {
-                            handler.postDelayed({
-                                performGlobalAction(GLOBAL_ACTION_HOME)
-                            }, 50L * i)
+                        // If this app is currently in foreground, go home
+                        if (packageName == lastForegroundPackage) {
+                            performGoHomeAction()
                         }
-                        
-                        // نمایش صفحه قفل با کمی تأخیر
-                        handler.postDelayed({
-                            showLockScreen(packageName)
-                        }, 150)
-                        
-                        // توقف هرگونه ردیابی برای این اپ
-                        if (currentForegroundApp == packageName) {
-                            // زمان استفاده تا این لحظه را ثبت می‌کنیم
-                            updateAppUsageTime(packageName)
-                            currentForegroundApp = null
-                        }
-                        
-                        return  // پردازش بیشتر را متوقف می‌کنیم
                     }
-                    
-                    // **مرحله 2: ردیابی استفاده از اپلیکیشن‌ها**
-                    // فقط اگر اپلیکیشن قفل نیست، آن را ردیابی می‌کنیم
-                    
-                    // اگر اپلیکیشن عوض شده است
-                    if (packageName != currentForegroundApp) {
-                        // زمان استفاده از اپلیکیشن قبلی را به‌روزرسانی می‌کنیم
-                        currentForegroundApp?.let { 
-                            Log.d(TAG, "Updating usage time for previous app: $it")
-                            updateAppUsageTime(it)
-                        }
-                        
-                        // شروع ردیابی اپلیکیشن جدید
-                        currentForegroundApp = packageName
-                        appStartTime = System.currentTimeMillis()
-                        
-                        Log.d(TAG, "Started tracking usage for app: $packageName")
-                        
-                        // فوری بررسی می‌کنیم که آیا این اپلیکیشن محدودیت زمانی دارد
-                        checkAppTimeLimit(packageName)
-                        
-                        // شروع بررسی دوره‌ای
-                        startPeriodicChecking(packageName)
+                    "com.example.flutter_application_512.APP_UNLOCKED" -> {
+                        val packageName = intent.getStringExtra("packageName")
+                        Log.d(TAG, "Received unlock notification for: $packageName")
+                    }
+                    SERVICE_RESTART_ACTION -> {
+                        Log.d(TAG, "Received service restart request")
+                        // No need to restart here since we're already running
+                        // Just update the heartbeat to confirm we're active
+                        updateHeartbeat()
                     }
                 }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error in onAccessibilityEvent", e)
-        }
-    }
-
-    private fun startPeriodicChecking(packageName: String) {
-        // توقف بررسی‌های قبلی
-        stopPeriodicChecking()
-        
-        // شروع بررسی جدید
-        checkingRunnable = Runnable {
-            if (currentForegroundApp == packageName) {
-                // بررسی مجدد محدودیت زمانی
-                checkAppTimeLimit(packageName)
-                
-                // همچنین با استفاده از روش دیگر بررسی می‌کنیم که برنامه همچنان در فورگراند است
-                verifyForegroundApp(packageName)
-                
-                // ادامه بررسی دوره‌ای
-                handler.postDelayed(checkingRunnable!!, CHECK_INTERVAL)
             }
         }
         
-        // شروع اولین بررسی
-        handler.postDelayed(checkingRunnable!!, CHECK_INTERVAL)
-    }
-    
-    private fun verifyForegroundApp(expectedPackage: String) {
-        try {
-            // با استفاده از UsageStatsManager بررسی می‌کنیم که آیا برنامه مورد انتظار واقعاً در فورگراند است
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                val usageStatsManager = getSystemService(Context.USAGE_STATS_SERVICE) as android.app.usage.UsageStatsManager
-                val time = System.currentTimeMillis()
-                
-                // بررسی 5 ثانیه اخیر
-                val usageEvents = usageStatsManager.queryEvents(time - 5000, time)
-                val event = android.app.usage.UsageEvents.Event()
-                
-                // بررسی آخرین برنامه فعال شده
-                var lastForegroundApp: String? = null
-                var lastEventTime = 0L
-                
-                while (usageEvents.hasNextEvent()) {
-                    usageEvents.getNextEvent(event)
-                    if (event.eventType == android.app.usage.UsageEvents.Event.MOVE_TO_FOREGROUND && 
-                        event.timeStamp > lastEventTime) {
-                        lastForegroundApp = event.packageName
-                        lastEventTime = event.timeStamp
-                    }
-                }
-                
-                // اگر برنامه فورگراند با انتظار ما متفاوت است، به‌روزرسانی می‌کنیم
-                if (lastForegroundApp != null && lastForegroundApp != expectedPackage) {
-                    Log.d(TAG, "Detected app switch: $expectedPackage -> $lastForegroundApp")
-                    
-                    // بررسی می‌کنیم که آیا برنامه جدید قفل شده است
-                    if (isAppLocked(lastForegroundApp)) {
-                        Log.d(TAG, "BLOCKING APP: $lastForegroundApp is locked!")
-                        
-                        // بستن فوری برنامه
-                        performGlobalAction(GLOBAL_ACTION_HOME)
-                        
-                        // نمایش صفحه قفل
-                        handler.postDelayed({
-                            showLockScreen(lastForegroundApp)
-                        }, 100)
-                        
-                        return
-                    }
-                    
-                    // به‌روزرسانی ردیابی اپلیکیشن
-                    updateAppUsageTime(expectedPackage)
-                    currentForegroundApp = lastForegroundApp
-                    appStartTime = System.currentTimeMillis()
-                    
-                    // بررسی محدودیت زمانی برای اپلیکیشن جدید
-                    checkAppTimeLimit(lastForegroundApp)
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error verifying foreground app", e)
+        val filter = IntentFilter().apply {
+            addAction("com.example.flutter_application_512.APP_LOCKED")
+            addAction("com.example.flutter_application_512.APP_UNLOCKED")
+            addAction(SERVICE_RESTART_ACTION)
         }
+        registerReceiver(appLockReceiver, filter)
     }
     
-    private fun stopPeriodicChecking() {
-        checkingRunnable?.let {
-            handler.removeCallbacks(it)
-            checkingRunnable = null
-        }
-    }
-    
-    private fun checkAppTimeLimit(packageName: String) {
+    private fun loadUsageData() {
         try {
-            // دریافت محدودیت‌های زمانی از تنظیمات
-            val timeLimitsJson = prefs.getString(TIME_LIMITS_KEY, "{}")
-            val timeLimits = JSONObject(timeLimitsJson ?: "{}")
-            
-            // دریافت داده‌های استفاده از تنظیمات
             val usageDataJson = prefs.getString(APP_USAGE_DATA_KEY, "{}")
             val usageData = JSONObject(usageDataJson ?: "{}")
             
-            // بررسی می‌کنیم که آیا این اپلیکیشن محدودیت زمانی دارد
-            if (timeLimits.has(packageName)) {
-                val limitInMinutes = timeLimits.getLong(packageName)
-                val limitInMillis = limitInMinutes * 60 * 1000
-                
-                // اگر محدودیت صفر باشد، برنامه نباید قفل شود
-                if (limitInMinutes <= 0) {
-                    // اگر قبلاً قفل بوده، قفل را برداریم
-                    if (prefs.getBoolean("app_locked_$packageName", false)) {
-                        setAppLocked(packageName, false)
+            // Clear our current tracking map and repopulate it
+            currentDayUsage.clear()
+            
+            // If we have existing usage data, load it
+            usageData.keys().forEach { key ->
+                if (key != "JSONObject" && !key.startsWith("org.json")) { // Avoid strange JSON parsing quirks
+                    try {
+                        val timeUsed = usageData.getLong(key)
+                        currentDayUsage[key] = timeUsed
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error parsing usage time for $key", e)
                     }
-                    return
-                }
-                
-                // دریافت زمان استفاده کلی برای این اپلیکیشن
-                val currentUsageMillis = if (usageData.has(packageName)) 
-                                            usageData.getLong(packageName) 
-                                         else 
-                                            0L
-                                            
-                // اضافه کردن زمان سشن فعلی
-                val currentSessionTime = System.currentTimeMillis() - appStartTime
-                val totalUsageTime = currentUsageMillis + currentSessionTime
-                
-                Log.d(TAG, "App $packageName time check: used=${totalUsageTime/1000}s, limit=${limitInMillis/1000}s")
-                
-                // بررسی می‌کنیم که آیا از محدودیت فراتر رفته
-                if (totalUsageTime >= limitInMillis) {
-                    Log.d(TAG, "TIME LIMIT EXCEEDED for $packageName: ${totalUsageTime/1000}s >= ${limitInMillis/1000}s")
-                    
-                    // ذخیره زمان استفاده قبل از قفل کردن
-                    updateAppUsageTime(packageName)
-                    
-                    // تنظیم فلگ قفل برای جلوگیری از باز شدن مجدد
-                    setAppLocked(packageName, true)
-                    
-                    // بستن اپلیکیشن
-                    returnToHome()
-                    
-                    // نمایش صفحه قفل
-                    showLockScreen(packageName)
-                    
-                    // به‌روزرسانی وضعیت ردیابی
-                    currentForegroundApp = null
-                    
-                    // توقف بررسی دوره‌ای
-                    stopPeriodicChecking()
-                }
-            } else {
-                // اگر محدودیت زمانی ندارد ولی قبلاً قفل بوده، قفل را برداریم
-                if (prefs.getBoolean("app_locked_$packageName", false)) {
-                    setAppLocked(packageName, false)
                 }
             }
+            
+            Log.d(TAG, "Loaded usage data for ${currentDayUsage.size} apps")
         } catch (e: Exception) {
-            Log.e(TAG, "Error checking app time limit", e)
+            Log.e(TAG, "Error loading usage data", e)
         }
     }
     
-    private fun updateAppUsageTime(packageName: String) {
+    private fun saveUsageData() {
         try {
-            val currentTime = System.currentTimeMillis()
-            val sessionDuration = currentTime - appStartTime
+            val usageData = JSONObject()
+            currentDayUsage.forEach { (packageName, timeUsed) ->
+                usageData.put(packageName, timeUsed)
+            }
             
-            // Only update if the session is meaningful (more than 1 second)
-            if (sessionDuration > 1000) {
-                // Get current usage data
-                val usageDataJson = prefs.getString(APP_USAGE_DATA_KEY, "{}")
-                val usageData = JSONObject(usageDataJson ?: "{}")
-                
-                // Update usage time for this app
-                val currentUsage = if (usageData.has(packageName)) usageData.getLong(packageName) else 0L
-                val newUsage = currentUsage + sessionDuration
-                usageData.put(packageName, newUsage)
-                
-                // Save updated usage data
-                prefs.edit().putString(APP_USAGE_DATA_KEY, usageData.toString()).apply()
-                
-                // Reset start time
-                appStartTime = currentTime
-                
-                Log.d(TAG, "Updated usage time for $packageName: $newUsage ms")
+            prefs.edit().putString(APP_USAGE_DATA_KEY, usageData.toString()).apply()
+            Log.d(TAG, "Saved usage data")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error saving usage data", e)
+        }
+    }
+    
+    private fun startPeriodicChecks() {
+        if (runnable == null) {
+            runnable = Runnable {
+                checkForegroundApp()
+                handler.postDelayed(runnable!!, CHECK_INTERVAL)
+            }
+            handler.post(runnable!!)
+        }
+    }
+    
+    private fun stopPeriodicChecks() {
+        runnable?.let { handler.removeCallbacks(it) }
+        runnable = null
+    }
+    
+    override fun onAccessibilityEvent(event: AccessibilityEvent) {
+        // Update last event time to help with detection
+        lastEventTime = System.currentTimeMillis()
+        
+        // Only process events that indicate a window state change
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED || 
+            event.eventType == AccessibilityEvent.TYPE_WINDOWS_CHANGED) {
+            
+            val packageName = event.packageName?.toString() ?: ""
+            if (packageName.isNotEmpty() && packageName != "android" && !packageName.startsWith("com.android")) {
+                if (lastForegroundPackage != packageName) {
+                    handleAppSwitch(packageName)
+                }
+            }
+        }
+    }
+    
+    private fun handleAppSwitch(newPackage: String) {
+        val now = System.currentTimeMillis()
+        
+        // Don't process app switches that happen too quickly (likely false positives)
+        if (now - lastAppSwitchTime < timeBeforeConsideringNewApp) {
+            Log.d(TAG, "Ignoring rapid app switch to $newPackage")
+            return
+        }
+        
+        // Record app switch time
+        lastAppSwitchTime = now
+        
+        // Check if the former app should be tracked
+        if (isAppTracked(lastForegroundPackage) && lastForegroundPackage.isNotEmpty()) {
+            val usedTime = currentDayUsage.getOrDefault(lastForegroundPackage, 0L) + currentForegroundTime
+            currentDayUsage[lastForegroundPackage] = usedTime
+            Log.d(TAG, "Updated usage for $lastForegroundPackage: $usedTime ms")
+            
+            // Save after each significant app switch
+            saveUsageData()
+        }
+        
+        // Update foreground app
+        lastForegroundPackage = newPackage
+        currentForegroundTime = 0
+        
+        // Immediately check if the new app should be locked
+        checkAndLockApp(newPackage)
+        
+        // If app is locked, show lock screen
+        if (isAppLocked(newPackage)) {
+            Log.d(TAG, "User attempted to open locked app: $newPackage")
+            showLockScreen(newPackage)
+        }
+        
+        // Update heartbeat to show service is active
+        updateHeartbeat()
+    }
+    
+    private fun checkForegroundApp() {
+        // Prevent concurrent execution
+        if (isCheckingInProgress) return
+        isCheckingInProgress = true
+        
+        try {
+            // Verify we have a recent event (within last 500ms) to ensure service is working
+            val now = System.currentTimeMillis()
+            val timeSinceLastEvent = now - lastEventTime
+            
+            // If app is actively being used, update time
+            if (lastForegroundPackage.isNotEmpty() && isAppTracked(lastForegroundPackage)) {
+                // Only count time if the service is actively detecting events and screen is on
+                if (timeSinceLastEvent < 500 && isScreenOn()) {
+                    currentForegroundTime += CHECK_INTERVAL
+                    
+                    // Get current usage including current session
+                    val totalUsageTime = currentDayUsage.getOrDefault(lastForegroundPackage, 0L) + currentForegroundTime
+
+                    // Log usage time more frequently for apps close to their limits (Telegram fix)
+                    if (totalUsageTime % 5000 < CHECK_INTERVAL) {
+                        Log.d(TAG, "⏱️ App usage: $lastForegroundPackage - ${totalUsageTime/1000}s (session: ${currentForegroundTime/1000}s)")
+                    }
+                    
+                    // Check for time limit exceeded
+                    checkTimeLimitExceeded(lastForegroundPackage, totalUsageTime)
+                }
+            } else {
+                // Check if we're actually in another app that's not being detected through normal events
+                // This helps fix issues with apps like Telegram that might be missed
+                verifyForegroundAppWithUsageStats()
+            }
+            
+            // Periodically update heartbeat (every 30 seconds)
+            if (now % 30000 < CHECK_INTERVAL) {
+                updateHeartbeat()
+            }
+            
+            // Save usage data more frequently (every 30 seconds)
+            if (now % 30000 < CHECK_INTERVAL) {
+                saveUsageData()
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Error updating app usage time", e)
+            Log.e(TAG, "Error in checkForegroundApp", e)
+        } finally {
+            isCheckingInProgress = false
+        }
+    }
+    
+    private fun verifyForegroundAppWithUsageStats() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
+            try {
+                val usm = usageManager ?: return
+                val time = System.currentTimeMillis()
+                val events = usm.queryEvents(time - 3000, time)
+                val event = android.app.usage.UsageEvents.Event()
+                
+                var lastEventPackageName: String? = null
+                var lastEventTime = 0L
+                
+                while (events.hasNextEvent()) {
+                    events.getNextEvent(event)
+                    if (event.eventType == android.app.usage.UsageEvents.Event.MOVE_TO_FOREGROUND && 
+                        event.timeStamp > lastEventTime) {
+                        lastEventPackageName = event.packageName
+                        lastEventTime = event.timeStamp
+                    }
+                }
+                
+                if (lastEventPackageName != null && 
+                    lastEventPackageName != lastForegroundPackage &&
+                    lastEventPackageName != "android" &&
+                    !lastEventPackageName.startsWith("com.android")) {
+                    
+                    Log.d(TAG, "⚠️ Detected foreground app change through UsageStats: $lastEventPackageName")
+                    
+                    // Handle this as an app switch
+                    handleAppSwitch(lastEventPackageName)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error verifying foreground app with usage stats", e)
+            }
+        }
+    }
+    
+    private fun checkTimeLimitExceeded(packageName: String, totalUsageTime: Long) {
+        try {
+            // Read time limits
+            val timeLimitsJson = prefs.getString(TIME_LIMITS_KEY, "{}")
+            val timeLimits = JSONObject(timeLimitsJson ?: "{}")
+            
+            // Check if this app has a time limit
+            if (timeLimits.has(packageName)) {
+                val limitMinutes = timeLimits.getLong(packageName)
+                val limitMs = limitMinutes * 60 * 1000
+                
+                // If time used exceeds limit, lock the app
+                if (totalUsageTime >= limitMs) {
+                    // Lock only if not already locked
+                    if (!isAppLocked(packageName)) {
+                        Log.d(TAG, "🔒 Time limit exceeded for $packageName: ${totalUsageTime/1000}s >= ${limitMs/1000}s")
+                        
+                        // Update usage in shared prefs before locking
+                        currentDayUsage[packageName] = totalUsageTime
+                        saveUsageData()
+                        
+                        // Lock the app
+                        lockApp(packageName)
+                        
+                        // If currently in foreground, go home
+                        if (packageName == lastForegroundPackage) {
+                            // Double-check that we're going home successfully
+                            performGoHomeAction()
+                            
+                            // Also try closing recent apps as a backup
+                            handler.postDelayed({
+                                try {
+                                    performGlobalAction(GLOBAL_ACTION_RECENTS)
+                                    handler.postDelayed({
+                                        performGlobalAction(GLOBAL_ACTION_HOME)
+                                    }, 300)
+                                } catch (e: Exception) {
+                                    Log.e(TAG, "Error performing recents action", e)
+                                }
+                            }, 500)
+                        }
+                    }
+                }
+                // Alert when approaching limit (90%)
+                else if (totalUsageTime >= limitMs * 0.9 && 
+                         totalUsageTime < limitMs && 
+                         totalUsageTime % 30000 < CHECK_INTERVAL) {
+                    // Show a warning every 30 seconds when close to limit
+                    val timeLeftSeconds = (limitMs - totalUsageTime) / 1000
+                    Log.d(TAG, "⚠️ Approaching time limit for $packageName: ${timeLeftSeconds}s left")
+                    
+                    // Show toast notification
+                    if (packageName == lastForegroundPackage) {
+                        handler.post {
+                            try {
+                                val appName = getAppName(packageName)
+                                Toast.makeText(
+                                    this, 
+                                    "$appName: ${timeLeftSeconds}s از زمان مجاز باقی مانده", 
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            } catch (e: Exception) {
+                                // Ignore errors in toast display
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error checking time limits", e)
+        }
+    }
+    
+    private fun checkAndLockApp(packageName: String) {
+        // Skip system packages and non-tracked apps
+        if (packageName.isEmpty() || packageName == "android" || 
+            packageName.startsWith("com.android") || !isAppTracked(packageName)) {
+            return
+        }
+        
+        try {
+            // First check if app is already locked
+            if (isAppLocked(packageName)) {
+                Log.d(TAG, "$packageName is locked, returning to home")
+                performGoHomeAction()
+                
+                // Show lock screen
+                showLockScreen(packageName)
+                return
+            }
+            
+            // Then check time limits
+            val timeLimitsJson = prefs.getString(TIME_LIMITS_KEY, "{}")
+            val timeLimits = JSONObject(timeLimitsJson ?: "{}")
+            
+            if (timeLimits.has(packageName)) {
+                val limitMinutes = timeLimits.getLong(packageName)
+                val limitMs = limitMinutes * 60 * 1000
+                
+                // Get current usage from our tracking map
+                val usageTime = currentDayUsage.getOrDefault(packageName, 0L)
+                
+                // If already over limit, lock app
+                if (usageTime >= limitMs) {
+                    Log.d(TAG, "Time limit already exceeded for $packageName")
+                    lockApp(packageName)
+                    performGoHomeAction()
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error in checkAndLockApp", e)
+        }
+    }
+    
+    private fun isAppTracked(packageName: String): Boolean {
+        try {
+            if (packageName.isEmpty()) return false
+            
+            val trackingAppsJson = prefs.getString(TRACKING_APPS_KEY, "[]")
+            val trackingApps = JSONArray(trackingAppsJson ?: "[]")
+            
+            for (i in 0 until trackingApps.length()) {
+                if (trackingApps.getString(i) == packageName) {
+                    return true
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error checking if app is tracked", e)
+        }
+        return false
+    }
+    
+    private fun isAppLocked(packageName: String): Boolean {
+        try {
+            val lockedAppsJson = prefs.getString(LOCKED_APPS_KEY, "[]")
+            val lockedApps = JSONArray(lockedAppsJson ?: "[]")
+            
+            for (i in 0 until lockedApps.length()) {
+                if (lockedApps.getString(i) == packageName) {
+                    return true
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error checking if app is locked", e)
+        }
+        return false
+    }
+    
+    private fun lockApp(packageName: String) {
+        try {
+            // Get current locked apps list
+            val lockedAppsJson = prefs.getString(LOCKED_APPS_KEY, "[]")
+            val lockedApps = JSONArray(lockedAppsJson ?: "[]")
+            
+            // Check if already locked to avoid duplicates
+            for (i in 0 until lockedApps.length()) {
+                if (lockedApps.getString(i) == packageName) {
+                    // Already locked
+                    return
+                }
+            }
+            
+            // Add to locked apps
+            lockedApps.put(packageName)
+            prefs.edit().putString(LOCKED_APPS_KEY, lockedApps.toString()).apply()
+            
+            // Broadcast that app is locked
+            val intent = Intent("com.example.flutter_application_512.APP_LOCKED").apply {
+                putExtra("packageName", packageName)
+            }
+            sendBroadcast(intent)
+            
+            Log.d(TAG, "🔒 Locked app: $packageName")
+            
+            // Show notification to user
+            handler.post {
+                try {
+                    val appName = getAppName(packageName)
+                    Toast.makeText(this, "زمان استفاده از $appName به پایان رسید", Toast.LENGTH_LONG).show()
+                } catch (e: Exception) {
+                    // Ignore errors in toast display
+                }
+            }
+            
+            // Special handling for problematic apps (e.g., Telegram)
+            if (packageName == "org.telegram.messenger" || 
+                packageName == "com.whatsapp" || 
+                packageName == "com.instagram.android") {
+                
+                // Force-close recent apps and return to home
+                handler.postDelayed({
+                    try {
+                        performGlobalAction(GLOBAL_ACTION_RECENTS)
+                        handler.postDelayed({
+                            performGlobalAction(GLOBAL_ACTION_HOME)
+                        }, 300)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error forcing app closure", e)
+                    }
+                }, 300)
+            }
+            
+            // نمایش صفحه قفل با استفاده از متد showLockScreen
+            showLockScreen(packageName)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error locking app", e)
         }
     }
     
@@ -638,238 +557,128 @@ class AppLockAccessibilityService : AccessibilityService() {
             }
             
             // اطلاعات برنامه را دریافت می‌کنیم
-            val appName = try {
-                val appInfo = packageManager.getApplicationInfo(packageName, 0)
-                packageManager.getApplicationLabel(appInfo).toString()
-            } catch (e: Exception) {
-                "برنامه"
+            val appName = getAppName(packageName)
+            
+            // دریافت اطلاعات زمان استفاده و محدودیت
+            val timeLimitsJson = prefs.getString(TIME_LIMITS_KEY, "{}")
+            val timeLimits = JSONObject(timeLimitsJson ?: "{}")
+            
+            var timeLimitMinutes = 0L
+            if (timeLimits.has(packageName)) {
+                timeLimitMinutes = timeLimits.getLong(packageName)
             }
             
-            // استخراج زمان استفاده و محدودیت زمانی از SharedPreferences
-            val usageMinutes = getAppUsageTime(packageName) / (60 * 1000)
-            val timeLimitMinutes = getAppTimeLimit(packageName)
+            val usageMs = currentDayUsage.getOrDefault(packageName, 0L)
+            val usageMinutes = usageMs / (60 * 1000)
             
-            // نمایش فعالیت قفل با اطلاعات کامل
+            // ایجاد Intent برای نمایش Activity قفل
             val lockIntent = Intent(this, AppLockOverlayActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or 
+                        Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                        Intent.FLAG_ACTIVITY_NO_HISTORY
                 putExtra(AppLockOverlayActivity.EXTRA_PACKAGE_NAME, packageName)
                 putExtra(AppLockOverlayActivity.EXTRA_APP_NAME, appName)
                 putExtra(AppLockOverlayActivity.EXTRA_TIME_USED, usageMinutes)
                 putExtra(AppLockOverlayActivity.EXTRA_TIME_LIMIT, timeLimitMinutes)
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or 
-                         Intent.FLAG_ACTIVITY_CLEAR_TOP or 
-                         Intent.FLAG_ACTIVITY_SINGLE_TOP)
             }
             
+            // نمایش اکتیویتی
             startActivity(lockIntent)
-            AppLockOverlayActivity.isLockScreenShowing = true
             
-            // فعال‌سازی مجدد بررسی‌کننده
+            Log.d(TAG, "Showing lock screen for $packageName")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error showing lock screen", e)
+        }
+    }
+    
+    private fun performGoHomeAction() {
+        try {
+            // More reliable home action implementation
+            val homeIntent = Intent(Intent.ACTION_MAIN).apply {
+                addCategory(Intent.CATEGORY_HOME)
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            }
+            startActivity(homeIntent)
+            
+            // As fallback also try the traditional approach
+            performGlobalAction(GLOBAL_ACTION_HOME)
+            
+            // For problematic apps, try to use recents menu
             handler.postDelayed({
-                AppLockOverlayActivity.isLockScreenShowing = false
-            }, 2000) // زمان کافی برای نمایش صفحه قفل
+                try {
+                    performGlobalAction(GLOBAL_ACTION_RECENTS)
+                    handler.postDelayed({
+                        performGlobalAction(GLOBAL_ACTION_HOME)
+                    }, 200)
+                } catch (e: Exception) {
+                    // Ignore errors
+                }
+            }, 300)
             
-            Log.d(TAG, "Lock screen shown for $packageName")
+            Log.d(TAG, "Performed go home action")
         } catch (e: Exception) {
-            Log.e(TAG, "Error showing lock screen for $packageName", e)
+            Log.e(TAG, "Error performing go home action", e)
         }
     }
     
-    // دریافت زمان استفاده از برنامه بر حسب میلی‌ثانیه
-    private fun getAppUsageTime(packageName: String): Long {
-        try {
-            val usageDataJson = prefs.getString(APP_USAGE_DATA_KEY, "{}")
-            val usageData = JSONObject(usageDataJson ?: "{}")
-            
-            return if (usageData.has(packageName)) {
-                usageData.getLong(packageName)
-            } else {
-                0L
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error getting app usage time", e)
-            return 0L
+    private fun isScreenOn(): Boolean {
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT_WATCH) {
+            powerManager.isInteractive
+        } else {
+            @Suppress("DEPRECATION")
+            powerManager.isScreenOn
         }
     }
     
-    // دریافت محدودیت زمانی برنامه بر حسب دقیقه
-    private fun getAppTimeLimit(packageName: String): Long {
+    private fun getAppName(packageName: String): String {
         try {
-            val timeLimitsJson = prefs.getString(TIME_LIMITS_KEY, "{}")
-            val timeLimits = JSONObject(timeLimitsJson ?: "{}")
-            
-            return if (timeLimits.has(packageName)) {
-                timeLimits.getLong(packageName)
-            } else {
-                0L
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error getting app time limit", e)
-            return 0L
+            val packageManager = applicationContext.packageManager
+            val appInfo = packageManager.getApplicationInfo(packageName, 0)
+            return packageManager.getApplicationLabel(appInfo).toString()
+        } catch (e: PackageManager.NameNotFoundException) {
+            return packageName
         }
     }
     
-    // متد جدید برای تنظیم وضعیت قفل برنامه‌ها
-    private fun setAppLocked(packageName: String, locked: Boolean) {
+    private fun updateHeartbeat() {
         try {
-            // بررسی وضعیت فعلی
-            val currentlyLocked = prefs.getBoolean("app_locked_$packageName", false)
-            
-            // اگر وضعیت تغییر کرده، آن را ذخیره کن
-            if (currentlyLocked != locked) {
-                prefs.edit().putBoolean("app_locked_$packageName", locked).apply()
-                
-                if (locked) {
-                    Log.d(TAG, "App $packageName is now locked")
-                    
-                    // فرستادن یک رویداد برودکست برای اطلاع‌رسانی به کامپوننت‌های دیگر
-                    val intent = Intent("com.example.flutter_application_512.APP_LOCKED")
-                    intent.putExtra("packageName", packageName)
-                    sendBroadcast(intent)
-                } else {
-                    Log.d(TAG, "App $packageName is now unlocked")
-                    
-                    // فرستادن یک رویداد برودکست برای اطلاع‌رسانی به کامپوننت‌های دیگر
-                    val intent = Intent("com.example.flutter_application_512.APP_UNLOCKED")
-                    intent.putExtra("packageName", packageName)
-                    sendBroadcast(intent)
-                }
-            }
+            prefs.edit().putLong("accessibility_service_last_heartbeat", System.currentTimeMillis()).apply()
+            // Also update general last heartbeat
+            prefs.edit().putLong("last_heartbeat", System.currentTimeMillis()).apply()
         } catch (e: Exception) {
-            Log.e(TAG, "Error setting app lock status", e)
+            Log.e(TAG, "Error updating heartbeat", e)
         }
     }
     
-    private fun returnToHome() {
-        val homeIntent = Intent(Intent.ACTION_MAIN)
-        homeIntent.addCategory(Intent.CATEGORY_HOME)
-        homeIntent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
-        startActivity(homeIntent)
+    override fun onInterrupt() {
+        Log.d(TAG, "Service interrupted")
     }
-
-    // بهبود تشخیص قفل بودن اپلیکیشن
-    private fun isAppLocked(packageName: String): Boolean {
+    
+    override fun onDestroy() {
+        isServiceRunning = false
+        Log.d(TAG, "Service destroyed")
+        
+        // Save final usage data
+        saveUsageData()
+        
+        // Stop periodic checks
+        stopPeriodicChecks()
+        
+        // Unregister receiver
         try {
-            // ابتدا بررسی می‌کنیم آیا این اپلیکیشن در لیست قفل شده‌ها قرار دارد
-            val isLocked = prefs.getBoolean("app_locked_$packageName", false)
-            
-            if (isLocked) {
-                // همچنین بررسی می‌کنیم که آیا محدودیت زمانی هنوز وجود دارد
-                val timeLimitsJson = prefs.getString(TIME_LIMITS_KEY, "{}")
-                val timeLimits = JSONObject(timeLimitsJson ?: "{}")
-                
-                if (timeLimits.has(packageName)) {
-                    // محدودیت زمانی وجود دارد، بررسی می‌کنیم که آیا از محدودیت عبور کرده‌ایم
-                    val limitMinutes = timeLimits.getLong(packageName)
-                    
-                    // اگر محدودیت صفر باشد، قفل را برمی‌داریم
-                    if (limitMinutes <= 0) {
-                        prefs.edit().putBoolean("app_locked_$packageName", false).apply()
-                        Log.d(TAG, "App $packageName is no longer locked - time limit removed")
-                        return false
-                    }
-                    
-                    // دریافت زمان استفاده از برنامه
-                    val usageDataJson = prefs.getString(APP_USAGE_DATA_KEY, "{}")
-                    val usageData = JSONObject(usageDataJson ?: "{}")
-                    val usageMillis = if (usageData.has(packageName)) usageData.getLong(packageName) else 0L
-                    val limitMillis = limitMinutes * 60 * 1000
-                    
-                    // اگر زمان استفاده از محدودیت کمتر است (شاید بعد از ریست شدن)، قفل را برمی‌داریم
-                    if (usageMillis < limitMillis) {
-                        prefs.edit().putBoolean("app_locked_$packageName", false).apply()
-                        Log.d(TAG, "App $packageName is no longer locked - usage (${usageMillis/1000}s) is less than limit (${limitMillis/1000}s)")
-                        return false
-                    }
-                    
-                    // محدودیت زمانی وجود دارد و از آن عبور کرده‌ایم
-                    Log.d(TAG, "App $packageName is confirmed locked - has time limit and exceeded")
-                    return true
-                } else {
-                    // محدودیت زمانی برداشته شده، قفل را هم برمی‌داریم
-                    prefs.edit().putBoolean("app_locked_$packageName", false).apply()
-                    Log.d(TAG, "App $packageName is no longer locked - time limit removed")
-                    return false
-                }
-            } else {
-                // برنامه قفل نیست، اما ممکن است نیاز به بررسی محدودیت زمانی باشد
-                // دریافت محدودیت زمانی
-                val timeLimitsJson = prefs.getString(TIME_LIMITS_KEY, "{}")
-                val timeLimits = JSONObject(timeLimitsJson ?: "{}")
-                
-                if (timeLimits.has(packageName)) {
-                    val limitMinutes = timeLimits.getLong(packageName)
-                    
-                    // اگر محدودیت صفر باشد، برنامه قفل نیست
-                    if (limitMinutes <= 0) return false
-                    
-                    // دریافت زمان استفاده از برنامه
-                    val usageDataJson = prefs.getString(APP_USAGE_DATA_KEY, "{}")
-                    val usageData = JSONObject(usageDataJson ?: "{}")
-                    val usageMillis = if (usageData.has(packageName)) usageData.getLong(packageName) else 0L
-                    val limitMillis = limitMinutes * 60 * 1000
-                    
-                    // بررسی محدودیت زمانی
-                    if (usageMillis >= limitMillis) {
-                        // از محدودیت عبور کرده‌ایم، برنامه باید قفل شود
-                        prefs.edit().putBoolean("app_locked_$packageName", true).apply()
-                        Log.d(TAG, "App $packageName is now locked - usage (${usageMillis/1000}s) exceeds limit (${limitMillis/1000}s)")
-                        return true
-                    }
-                }
+            if (appLockReceiver != null) {
+                unregisterReceiver(appLockReceiver)
+                appLockReceiver = null
             }
-            
-            return false
         } catch (e: Exception) {
-            Log.e(TAG, "Error checking if app is locked", e)
-            return false
+            Log.e(TAG, "Error unregistering receiver", e)
         }
-    }
-
-    // ثبت براودکست ریسیور برای دریافت رویدادهای مربوط به تنظیم محدودیت زمانی
-    private fun registerBroadcastReceiver() {
-        try {
-            broadcastReceiver = object : BroadcastReceiver() {
-                override fun onReceive(context: Context, intent: Intent) {
-                    when (intent.action) {
-                        "com.example.flutter_application_512.TIME_LIMIT_SET" -> {
-                            val packageName = intent.getStringExtra("packageName")
-                            val limitMinutes = intent.getLongExtra("limitMinutes", 0)
-                            
-                            if (packageName != null) {
-                                Log.d(TAG, "Broadcast received: Time limit set for $packageName: $limitMinutes minutes")
-                                
-                                // اگر این برنامه در حال حاضر در فورگراند است و محدودیت آن به اتمام رسیده، آن را قفل کنیم
-                                if (packageName == currentForegroundApp) {
-                                    checkAppTimeLimit(packageName)
-                                }
-                            }
-                        }
-                        "com.example.flutter_application_512.APP_LOCKED",
-                        "com.example.flutter_application_512.APP_UNLOCKED" -> {
-                            val packageName = intent.getStringExtra("packageName")
-                            if (packageName != null) {
-                                Log.d(TAG, "Broadcast received: ${intent.action} for $packageName")
-                                
-                                // اگر این برنامه در حال حاضر در فورگراند است، وضعیت آن را بررسی کنیم
-                                if (packageName == currentForegroundApp) {
-                                    checkAppTimeLimit(packageName)
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            
-            val intentFilter = IntentFilter().apply {
-                addAction("com.example.flutter_application_512.TIME_LIMIT_SET")
-                addAction("com.example.flutter_application_512.APP_LOCKED")
-                addAction("com.example.flutter_application_512.APP_UNLOCKED")
-            }
-            
-            registerReceiver(broadcastReceiver, intentFilter)
-            Log.d(TAG, "Broadcast receiver registered for time limit events")
-        } catch (e: Exception) {
-            Log.e(TAG, "Error registering broadcast receiver", e)
-        }
+        
+        // Try to automatically restart the service
+        val restartIntent = Intent(SERVICE_RESTART_ACTION)
+        sendBroadcast(restartIntent)
+        
+        super.onDestroy()
     }
 } 

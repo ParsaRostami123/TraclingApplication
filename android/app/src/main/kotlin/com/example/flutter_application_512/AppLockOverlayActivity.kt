@@ -271,18 +271,29 @@ class AppLockOverlayActivity : Activity() {
         }
     }
     
+    // متد جدید برای رفتن به صفحه خانه
     private fun goToHomeScreen() {
         try {
-            // بازگشت به صفحه اصلی دستگاه
-            val homeIntent = Intent(Intent.ACTION_MAIN)
-            homeIntent.addCategory(Intent.CATEGORY_HOME)
-            homeIntent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            // انجام چندین اقدام برای اطمینان از بازگشت به خانه
+            
+            // 1. ارسال Intent برای بازگشت به خانه
+            val homeIntent = Intent(Intent.ACTION_MAIN).apply {
+                addCategory(Intent.CATEGORY_HOME)
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            }
             startActivity(homeIntent)
             
-            // بستن فعالیت فعلی
-            finish()
+            // 2. برای تأخیر در بسته شدن صفحه قفل
+            handler.postDelayed({
+                // بسته شدن صفحه قفل بعد از کمی تأخیر
+                finish()
+            }, 300)
+            
+            Log.d(TAG, "Returning to home screen")
         } catch (e: Exception) {
-            Log.e(TAG, "Error going to home screen", e)
+            Log.e(TAG, "Error returning to home screen", e)
+            // در صورت خطا، تلاش برای بستن صفحه قفل
+            finish()
         }
     }
     
