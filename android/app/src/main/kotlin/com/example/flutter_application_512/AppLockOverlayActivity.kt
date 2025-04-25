@@ -20,6 +20,12 @@ import android.os.Build
 import android.util.Log
 import android.view.KeyEvent
 import android.widget.ProgressBar
+import android.os.Vibrator
+import android.media.MediaPlayer
+import android.os.VibrationEffect
+import android.app.ActivityManager
+import android.app.usage.UsageStatsManager
+import android.app.usage.UsageEvents
 
 class AppLockOverlayActivity : Activity() {
 
@@ -40,6 +46,13 @@ class AppLockOverlayActivity : Activity() {
     private lateinit var imgAppIcon: ImageView
     private lateinit var btnReturnHome: Button
     private lateinit var rootView: View
+    
+    private val LOCK_CHECK_INTERVAL = 500L // چک کردن هر 500 میلی‌ثانیه
+    private var isForcedLockMode = false
+    private var lastLockTime = 0L
+    private var consecutiveBlockCount = 0
+    private var vibrator: Vibrator? = null
+    private var mediaPlayer: MediaPlayer? = null
     
     companion object {
         var isLockScreenShowing = false
@@ -102,6 +115,7 @@ class AppLockOverlayActivity : Activity() {
         timeUsedMinutes = intent.getLongExtra("timeUsed", intent.getLongExtra(EXTRA_TIME_USED, 0))
         timeLimitMinutes = intent.getLongExtra("timeLimit", intent.getLongExtra(EXTRA_TIME_LIMIT, 0))
         val forceLock = intent.getBooleanExtra("forceLock", false)
+        isForcedLockMode = forceLock
         
         // دریافت پیش‌فرض‌ها
         prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -119,15 +133,24 @@ class AppLockOverlayActivity : Activity() {
         startLockChecker()
         
         // اطمینان از بسته بودن برنامه قفل شده
-        forceCloseLockedApp()
+        if (packageName != null) {
+            forceCloseLockedApp(packageName!!)
+        }
         
         // اگر حالت قفل اجباری است، تنظیم بیشتر روی این صفحه
-        if (forceLock) {
+        if (isForcedLockMode) {
             setupForceLockMode()
         }
         
         // برای اطمینان، تنظیم یک تایمر برای بررسی‌های مکرر
         setupPeriodicChecks()
+        
+        // راه‌اندازی ویبراتور برای حالت قفل اجباری
+        vibrator = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator?
+        
+        // لاگ اطلاعات قفل
+        Log.d("AppLockOverlay", "🔒 نمایش صفحه قفل برای $appName ($packageName)")
+        Log.d("AppLockOverlay", "حالت قفل اجباری: $isForcedLockMode")
     }
     
     private fun initializeUIElements() {
@@ -206,12 +229,42 @@ class AppLockOverlayActivity : Activity() {
         Log.d(TAG, "Lock screen resumed, checking locked app status")
         // اطمینان از اینکه برنامه قفل شده نمی‌تواند به فوکوس برگردد
         checkAndBlockApp()
+        
+        // اطمینان از فعال بودن چک‌کننده قفل
+        startLockChecker()
+        
+        // در صورت قفل اجباری، بستن اپ قفل شده را انجام بده
+        if (isForcedLockMode && packageName != null && packageName!!.isNotEmpty()) {
+            Log.d("AppLockOverlay", "🔴 حالت قفل اجباری فعال. تلاش برای بستن برنامه $packageName")
+            forceCloseLockedApp(packageName!!)
+        }
+        
+        // لرزش دستگاه در حالت قفل اجباری
+        if (isForcedLockMode && vibrator != null) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                vibrator?.vibrate(VibrationEffect.createOneShot(500, VibrationEffect.DEFAULT_AMPLITUDE))
+            } else {
+                @Suppress("DEPRECATION")
+                vibrator?.vibrate(500)
+            }
+        }
     }
     
     override fun onDestroy() {
         super.onDestroy()
         isLockScreenShowing = false
         stopLockChecker()
+        
+        // آزاد کردن منابع مدیا پلیر
+        if (mediaPlayer != null) {
+            try {
+                mediaPlayer?.stop()
+                mediaPlayer?.release()
+                mediaPlayer = null
+            } catch (e: Exception) {
+                Log.e("AppLockOverlay", "خطا در آزادسازی منابع صوتی: ${e.message}")
+            }
+        }
     }
     
     override fun onBackPressed() {
@@ -230,23 +283,114 @@ class AppLockOverlayActivity : Activity() {
         if (packageName == null) return
         
         try {
-            Log.d(TAG, "Checking if $packageName is running and needs to be blocked")
-            val am = getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
-            val runningTasks = am.getRunningTasks(5)
+            // اگر زمان کوتاهی از آخرین قفل گذشته، تعداد دفعات متوالی را افزایش بده
+            val now = System.currentTimeMillis()
+            if (now - lastLockTime < 2000) {
+                consecutiveBlockCount++
+                
+                // اگر تعداد دفعات بالا رفت، به حالت قفل اجباری برو
+                if (consecutiveBlockCount > 5 && !isForcedLockMode) {
+                    Log.d("AppLockOverlay", "⚠️⚠️⚠️ تشخیص تلاش مکرر برای دور زدن قفل! فعال‌سازی حالت قفل اجباری")
+                    isForcedLockMode = true
+                    
+                    // پخش صدای هشدار
+                    setupAlertSound()
+                    
+                    // نمایش پیام به کاربر
+                    runOnUiThread {
+                        Toast.makeText(this, "تلاش مکرر برای دور زدن قفل شناسایی شد!", Toast.LENGTH_LONG).show()
+                    }
+                }
+            } else {
+                // ریست شمارنده در صورت گذشت زمان
+                consecutiveBlockCount = 0
+            }
+            lastLockTime = now
             
-            for (task in runningTasks) {
-                if (task.topActivity?.packageName == packageName) {
-                    Log.d(TAG, "Detected locked app in running tasks, forcing home screen")
-                    goToHomeScreen()
-                    break
+            // بررسی اینکه آیا اپ قفل شده در حال اجراست
+            val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            val isAppRunning = false
+            
+            // روش 1: بررسی تسک‌های در حال اجرا (در نسخه‌های پایین کار می‌کند)
+            try {
+                val tasks = am.getRunningTasks(10)
+                for (task in tasks) {
+                    if (task.topActivity?.packageName == packageName) {
+                        Log.d("AppLockOverlay", "🚨 شناسایی اجرای برنامه قفل شده در RunningTasks")
+                        forceCloseLockedApp(packageName!!)
+                        goToHomeScreen()
+                        return
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("AppLockOverlay", "خطا در بررسی RunningTasks: ${e.message}")
+            }
+            
+            // روش 2: بررسی پروسس‌های در حال اجرا
+            try {
+                val runningProcesses = am.runningAppProcesses
+                for (processInfo in runningProcesses) {
+                    if (processInfo.processName == packageName || processInfo.pkgList.contains(packageName)) {
+                        if (processInfo.importance <= ActivityManager.RunningAppProcessInfo.IMPORTANCE_VISIBLE) {
+                            Log.d("AppLockOverlay", "🚨 شناسایی اجرای برنامه قفل شده در RunningProcesses")
+                            forceCloseLockedApp(packageName!!)
+                            goToHomeScreen()
+                            return
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("AppLockOverlay", "خطا در بررسی RunningProcesses: ${e.message}")
+            }
+            
+            // روش 3: بررسی آخرین برنامه استفاده شده با UsageStats
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
+                try {
+                    val usageStatsManager = getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
+                    val time = System.currentTimeMillis()
+                    
+                    // بررسی آمار استفاده در 5 ثانیه اخیر
+                    val usageStats = usageStatsManager.queryUsageStats(
+                        UsageStatsManager.INTERVAL_DAILY,
+                        time - 5 * 1000,
+                        time
+                    )
+                    
+                    for (stat in usageStats) {
+                        if (stat.packageName == packageName && stat.lastTimeUsed > time - 5000) {
+                            Log.d("AppLockOverlay", "🚨 شناسایی اجرای برنامه قفل شده در UsageStats اخیر")
+                            forceCloseLockedApp(packageName!!)
+                            goToHomeScreen()
+                            return
+                        }
+                    }
+                    
+                    // بررسی رویدادهای اخیر
+                    val events = usageStatsManager.queryEvents(time - 5000, time)
+                    val event = UsageEvents.Event()
+                    
+                    while (events.hasNextEvent()) {
+                        events.getNextEvent(event)
+                        if (event.packageName == packageName &&
+                            event.timeStamp > time - 5000 && 
+                            event.eventType == UsageEvents.Event.MOVE_TO_FOREGROUND) {
+                            
+                            Log.d("AppLockOverlay", "🚨 شناسایی اجرای برنامه قفل شده در UsageEvents اخیر")
+                            forceCloseLockedApp(packageName!!)
+                            goToHomeScreen()
+                            return
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e("AppLockOverlay", "خطا در بررسی UsageStats: ${e.message}")
                 }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Error checking running apps", e)
+            Log.e("AppLockOverlay", "خطا در checkAndBlockApp: ${e.message}")
         }
     }
     
-    // شروع بررسی دوره‌ای
+    // شروع بررسی دوره‌ای با تناوب بیشتر
     private fun startLockChecker() {
         if (packageName == null) return
         
@@ -255,13 +399,16 @@ class AppLockOverlayActivity : Activity() {
         checkRunnable = Runnable {
             checkAndBlockApp()
             
-            // ادامه بررسی دوره‌ای
-            handler.postDelayed(checkRunnable!!, 1000) // هر یک ثانیه
+            // ادامه بررسی دوره‌ای با تناوب کوتاه‌تر برای پاسخگویی سریع‌تر
+            handler.postDelayed(checkRunnable!!, 500) // هر نیم ثانیه
         }
         
         // شروع بررسی دوره‌ای
-        handler.postDelayed(checkRunnable!!, 1000)
+        handler.postDelayed(checkRunnable!!, 500)
         Log.d(TAG, "Started periodic lock checker for $packageName")
+        
+        // شروع بررسی از همان ابتدا
+        checkAndBlockApp()
     }
     
     // توقف بررسی دوره‌ای
@@ -362,30 +509,43 @@ class AppLockOverlayActivity : Activity() {
         val handler = Handler(Looper.getMainLooper())
         handler.postDelayed(object : Runnable {
             override fun run() {
-                forceCloseLockedApp()
-                handler.postDelayed(this, 1000) // هر ثانیه چک کن
+                if (packageName != null) {
+                    forceCloseLockedApp(packageName!!)
+                }
+                handler.postDelayed(this, 500) // هر نیم ثانیه چک کن برای واکنش سریع‌تر
             }
-        }, 1000)
+        }, 500)
+        
+        // فعال کردن حالت قفل اجباری برای اطمینان بیشتر
+        setupForceLockMode()
     }
     
-    // بستن اجباری برنامه قفل شده
-    private fun forceCloseLockedApp() {
-        if (packageName != null) {
-            try {
-                // بسته شدن برنامه از طریق ساختن Intent خانه
-                val homeIntent = Intent(Intent.ACTION_MAIN)
-                homeIntent.addCategory(Intent.CATEGORY_HOME)
-                homeIntent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
-                startActivity(homeIntent)
+    // متد جدید برای بستن اجباری برنامه قفل شده
+    private fun forceCloseLockedApp(packageToClose: String) {
+        try {
+            // بررسی مجوز
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                Log.d("AppLockOverlay", "⚠️ نیاز به استفاده از راه‌های جایگزین برای بستن برنامه در اندروید 9+")
                 
-                // تلاش برای kill کردن پروسس برنامه
-                val am = getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
-                am.killBackgroundProcesses(packageName)
+                // ارسال برودکست به سرویس اصلی برای بستن برنامه
+                val intent = Intent("com.example.flutter_application_512.FORCE_CLOSE_APP")
+                intent.putExtra("package_name", packageToClose)
+                sendBroadcast(intent)
                 
-                Log.d(TAG, "Force close attempted for $packageName")
-            } catch (e: Exception) {
-                Log.e(TAG, "Error force closing app", e)
+                // تلاش برای رفتن به صفحه خانه
+                goToHomeScreen()
+                return
             }
+            
+            // در نسخه‌های قدیمی‌تر از روش سیستمی استفاده کن
+            val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            am.killBackgroundProcesses(packageToClose)
+            
+            // لاگ اطلاعات
+            Log.d("AppLockOverlay", "✅ درخواست بستن برنامه $packageToClose ارسال شد")
+            
+        } catch (e: Exception) {
+            Log.e("AppLockOverlay", "خطا در بستن برنامه: ${e.message}")
         }
     }
     
@@ -396,6 +556,16 @@ class AppLockOverlayActivity : Activity() {
             true
         } else {
             super.onKeyDown(keyCode, event)
+        }
+    }
+    
+    private fun setupAlertSound() {
+        try {
+            mediaPlayer = MediaPlayer.create(this, R.raw.lock_alert)
+            mediaPlayer?.isLooping = true
+            mediaPlayer?.start()
+        } catch (e: Exception) {
+            Log.e("AppLockOverlay", "خطا در پخش صدای هشدار: ${e.message}")
         }
     }
 } 
