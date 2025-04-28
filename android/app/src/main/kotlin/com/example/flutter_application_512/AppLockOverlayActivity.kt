@@ -74,66 +74,74 @@ class AppLockOverlayActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         
-        // تنظیم نمایش تمام صفحه و روی تمام برنامه‌ها
-        window.setFlags(
-            WindowManager.LayoutParams.FLAG_FULLSCREEN or 
-            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
-            WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-            WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
-            WindowManager.LayoutParams.FLAG_FULLSCREEN or 
-            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
-            WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-            WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
-        )
+        // دریافت فلگ نمایش داخل برنامه
+        val showInApp = intent.getBooleanExtra("showInApp", false)
         
-        // اطمینان از نمایش روی قفل صفحه و نمایش‌های دیگر
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
-            setShowWhenLocked(true)
-            setTurnScreenOn(true)
-        } else {
-            window.addFlags(
-                WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD or
-                WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
-                WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
-            )
+        // تنظیم نمایش تمام صفحه و روی تمام برنامه‌ها
+        if (showInApp) {
+            // تنظیم نوع پنجره برای نمایش روی برنامه‌های دیگر
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                window.setType(WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY)
+            } else {
+                window.setType(WindowManager.LayoutParams.TYPE_SYSTEM_ALERT)
+            }
+            
+            // تنظیمات پنجره برای نمایش روی برنامه‌های دیگر
+            val params = window.attributes.apply {
+                flags = flags or 
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                    WindowManager.LayoutParams.FLAG_FULLSCREEN or
+                    WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD or
+                    WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+                    WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+                dimAmount = 0.7f
+            }
+            window.attributes = params
+            
+            // تنظیم اولویت بالا برای پنجره
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                window.attributes.type = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+            } else {
+                window.attributes.type = WindowManager.LayoutParams.TYPE_SYSTEM_ALERT
+            }
         }
         
-        // مطمئن شویم که فوکوس دارد و خروج از آن سخت است
-        window.addFlags(WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL)
-        window.addFlags(WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM)
-        window.addFlags(WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN)
-        window.addFlags(WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS)
-        
+        // تنظیم محتوا
         setContentView(R.layout.activity_app_lock_overlay)
+        
+        // مقداردهی اولیه
+        prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        packageName = intent.getStringExtra(EXTRA_PACKAGE_NAME)
+        timeUsedMinutes = intent.getLongExtra(EXTRA_TIME_USED, 0)
+        timeLimitMinutes = intent.getLongExtra("timeLimit", intent.getLongExtra(EXTRA_TIME_LIMIT, 0))
+        val forceLock = intent.getBooleanExtra("forceLock", false)
+        val showFirst = intent.getBooleanExtra("showFirst", false) // دریافت فلگ جدید
+        isForcedLockMode = forceLock
         
         // ثبت کنیم که صفحه قفل در حال نمایش است
         isLockScreenShowing = true
         
         // دریافت اطلاعات از intent - پشتیبانی از هر دو نوع کلید (با نام جدید و قدیمی)
-        packageName = intent.getStringExtra("packageName") ?: intent.getStringExtra(EXTRA_PACKAGE_NAME)
-        val appName = intent.getStringExtra("appName") ?: intent.getStringExtra(EXTRA_APP_NAME) ?: "این برنامه"
-        timeUsedMinutes = intent.getLongExtra("timeUsed", intent.getLongExtra(EXTRA_TIME_USED, 0))
-        timeLimitMinutes = intent.getLongExtra("timeLimit", intent.getLongExtra(EXTRA_TIME_LIMIT, 0))
-        val forceLock = intent.getBooleanExtra("forceLock", false)
-        isForcedLockMode = forceLock
+        val appName = intent.getStringExtra(EXTRA_APP_NAME) ?: "این برنامه"
+        txtAppName.text = appName
         
-        // دریافت پیش‌فرض‌ها
-        prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        // مقداردهی UI
+        initializeUI()
         
-        // جلوگیری از بازگشت کاربر با دکمه بازگشت
-        setFinishOnTouchOutside(false)
+        // شروع چک کردن قفل
+        startLockCheck()
         
-        // initialize UI elements
-        initializeUIElements()
+        // تنظیم عنوان و پیام
+        updateUI()
         
-        // configure UI
-        setupUI()
+        // غیرفعال کردن دکمه‌های سخت‌افزاری
+        disableHardwareButtons()
         
-        // شروع بررسی دوره‌ای
-        startLockChecker()
-        
-        // اطمینان از بسته بودن برنامه قفل شده
-        if (packageName != null) {
+        // اگر در حالت نمایش داخل برنامه هستیم، برنامه هدف را ببند
+        if (showInApp && packageName != null) {
             forceCloseLockedApp(packageName!!)
         }
         
@@ -148,12 +156,17 @@ class AppLockOverlayActivity : Activity() {
         // راه‌اندازی ویبراتور برای حالت قفل اجباری
         vibrator = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator?
         
+        // اگر showFirst فعال است، ویبراتور را فعال کنیم برای جلب توجه بیشتر
+        if (showFirst) {
+            vibrateForAttention()
+        }
+        
         // لاگ اطلاعات قفل
         Log.d("AppLockOverlay", "🔒 نمایش صفحه قفل برای $appName ($packageName)")
-        Log.d("AppLockOverlay", "حالت قفل اجباری: $isForcedLockMode")
+        Log.d("AppLockOverlay", "حالت قفل اجباری: $isForcedLockMode, نمایش ابتدایی: $showFirst")
     }
     
-    private fun initializeUIElements() {
+    private fun initializeUI() {
         try {
             // یافتن عناصر UI
             txtTitle = findViewById(R.id.txtTitle)
@@ -163,27 +176,52 @@ class AppLockOverlayActivity : Activity() {
             imgAppIcon = findViewById(R.id.imgAppIcon)
             btnReturnHome = findViewById(R.id.btnReturnHome)
             rootView = findViewById(R.id.lockScreenRoot)
+            
+            // تنظیم رویداد کلیک برای دکمه بازگشت به خانه
+            btnReturnHome.setOnClickListener {
+                goHome()
+            }
+            
+            // تنظیم انیمیشن برای ورود صفحه قفل
+            val animation = AnimationUtils.loadAnimation(this, android.R.anim.slide_in_left)
+            rootView.startAnimation(animation)
         } catch (e: Exception) {
-            Log.e(TAG, "Error initializing UI elements", e)
+            Log.e(TAG, "Error initializing UI", e)
         }
     }
     
-    private fun setupUI() {
+    private fun setupUI(showFirst: Boolean = false) {
         try {
-            // نمایش اطلاعات برنامه قفل شده
+            // آماده‌سازی عناصر UI
+            txtTitle = findViewById(R.id.txtTitle)
+            txtMessage = findViewById(R.id.txtMessage)
+            txtTimeLimit = findViewById(R.id.txtTimeLimit)
+            txtAppName = findViewById(R.id.txtAppName)
+            imgAppIcon = findViewById(R.id.imgAppIcon)
+            btnReturnHome = findViewById(R.id.btnReturnHome)
+            rootView = findViewById(R.id.lockScreenRoot)
+            
+            val showInApp = intent.getBooleanExtra("showInApp", false)
+            
+            // لود آیکون برنامه و تنظیم نام آن
+            val appName = intent.getStringExtra(EXTRA_APP_NAME) ?: "این برنامه"
+            txtAppName.text = appName
+            
+            // تنظیم عنوان
+            if (showInApp) {
+                txtTitle.text = "زمان استفاده به پایان رسیده"
+                txtTitle.setTextColor(resources.getColor(android.R.color.holo_red_dark))
+            } else {
+                txtTitle.text = "برنامه قفل شده است"
+            }
+            
+            // لود آیکون برنامه
             if (packageName != null) {
                 try {
-                    val pm = packageManager
-                    val appInfo = pm.getApplicationInfo(packageName!!, 0)
-                    val actualAppName = pm.getApplicationLabel(appInfo).toString()
-                    val appIcon = pm.getApplicationIcon(appInfo)
-                    
-                    // نمایش آیکون و نام برنامه
+                    val packageManager = packageManager
+                    val appInfo = packageManager.getApplicationInfo(packageName!!, 0)
+                    val appIcon = packageManager.getApplicationIcon(appInfo)
                     imgAppIcon.setImageDrawable(appIcon)
-                    txtAppName.text = actualAppName
-                    
-                    // تنظیم پیام قفل
-                    txtTitle.text = "محدودیت زمانی $actualAppName به پایان رسیده"
                 } catch (e: PackageManager.NameNotFoundException) {
                     Log.e(TAG, "Error getting app info", e)
                     imgAppIcon.visibility = View.GONE
@@ -202,23 +240,22 @@ class AppLockOverlayActivity : Activity() {
             }
             txtTimeLimit.text = timeText
             
-            // پیام واضح‌تر برای کاربر
-            txtMessage.text = "محدودیت زمانی برنامه به پایان رسیده است.\nبرای استفاده مجدد، ابتدا باید محدودیت زمانی را از اپلیکیشن کنترل زمان حذف کنید."
-            
-            // دکمه‌ی بازگشت به صفحه اصلی
-            btnReturnHome.setOnClickListener {
-                goToHomeScreen()
+            // اضافه کردن پیام مناسب‌تر برای حالت نمایش ابتدایی
+            if (showFirst) {
+                txtMessage.text = "شما به محدودیت زمان استفاده از این برنامه رسیده‌اید. لطفاً کمی استراحت کنید یا به فعالیت دیگری بپردازید."
+                txtMessage.setTextColor(resources.getColor(android.R.color.holo_red_dark))
+            } else {
+                txtMessage.text = "شما به محدودیت زمان استفاده از این برنامه رسیده‌اید."
             }
             
-            // نمایش پیام به کاربر
-            Toast.makeText(this, "محدودیت زمانی برنامه به پایان رسیده است", Toast.LENGTH_LONG).show()
+            // تنظیم دکمه بازگشت به صفحه اصلی
+            btnReturnHome.setOnClickListener {
+                goHome()
+            }
             
-            // اعمال انیمیشن ورود
-            val animation = AnimationUtils.loadAnimation(this, android.R.anim.fade_in)
+            // تنظیم انیمیشن برای ورود صفحه قفل
+            val animation = AnimationUtils.loadAnimation(this, android.R.anim.slide_in_left)
             rootView.startAnimation(animation)
-            
-            // جلوگیری از دور زدن قفل
-            setFinishOnTouchOutside(false)
         } catch (e: Exception) {
             Log.e(TAG, "Error setting up UI", e)
         }
@@ -231,7 +268,7 @@ class AppLockOverlayActivity : Activity() {
         checkAndBlockApp()
         
         // اطمینان از فعال بودن چک‌کننده قفل
-        startLockChecker()
+        startLockCheck()
         
         // در صورت قفل اجباری، بستن اپ قفل شده را انجام بده
         if (isForcedLockMode && packageName != null && packageName!!.isNotEmpty()) {
@@ -253,7 +290,7 @@ class AppLockOverlayActivity : Activity() {
     override fun onDestroy() {
         super.onDestroy()
         isLockScreenShowing = false
-        stopLockChecker()
+        stopLockCheck()
         
         // آزاد کردن منابع مدیا پلیر
         if (mediaPlayer != null) {
@@ -268,14 +305,12 @@ class AppLockOverlayActivity : Activity() {
     }
     
     override fun onBackPressed() {
-        // محدود کردن تعداد فشار برای خروج
-        backPressCount++
-        Toast.makeText(this, "برای خروج از صفحه قفل، از دکمه 'بازگشت به صفحه اصلی' استفاده کنید", Toast.LENGTH_SHORT).show()
-        
-        // اگر بیش از 3 بار پشت سر هم بازگشت زد، به صفحه اصلی برود (برای جلوگیری از گیر کردن کاربر)
-        if (backPressCount >= 3) {
-            goToHomeScreen()
-        }
+        // جلوگیری از خروج با دکمه بازگشت
+        // هدایت به صفحه اصلی
+        val homeIntent = Intent(Intent.ACTION_MAIN)
+        homeIntent.addCategory(Intent.CATEGORY_HOME)
+        homeIntent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
+        startActivity(homeIntent)
     }
 
     // متد جدید برای بررسی و مسدود کردن اپلیکیشن قفل شده
@@ -391,10 +426,10 @@ class AppLockOverlayActivity : Activity() {
     }
     
     // شروع بررسی دوره‌ای با تناوب بیشتر
-    private fun startLockChecker() {
+    private fun startLockCheck() {
         if (packageName == null) return
         
-        stopLockChecker() // ابتدا بررسی قبلی را متوقف کن
+        stopLockCheck() // ابتدا بررسی قبلی را متوقف کن
         
         checkRunnable = Runnable {
             checkAndBlockApp()
@@ -412,7 +447,7 @@ class AppLockOverlayActivity : Activity() {
     }
     
     // توقف بررسی دوره‌ای
-    private fun stopLockChecker() {
+    private fun stopLockCheck() {
         if (checkRunnable != null) {
             handler.removeCallbacks(checkRunnable!!)
             checkRunnable = null
@@ -481,26 +516,42 @@ class AppLockOverlayActivity : Activity() {
     
     // ایجاد حالت قفل اجباری با مقاومت بیشتر در برابر بستن
     private fun setupForceLockMode() {
-        try {
-            // تغییر رنگ پس‌زمینه به قرمز برای تاکید بیشتر
-            rootView.setBackgroundColor(resources.getColor(android.R.color.holo_red_dark))
+        // تنظیمات اضافی برای حالت قفل اجباری
+        val showInApp = intent.getBooleanExtra("showInApp", false)
+        
+        if (showInApp) {
+            // برای نمایش داخل برنامه، متن پیام را تغییر می‌دهیم
+            txtMessage.text = "محدودیت زمانی این برنامه به پایان رسیده است. بعد از چند ثانیه برنامه بسته خواهد شد."
+            txtMessage.setTextColor(resources.getColor(android.R.color.holo_red_dark))
+            txtMessage.textSize = 18f
             
-            // تغییر متن دکمه و عملکرد آن
-            btnReturnHome.text = "متوجه شدم، بازگشت به صفحه اصلی"
+            // تایمر برای نمایش زمان باقی‌مانده تا بسته شدن برنامه
+            val countdownTime = 2500L // میلی‌ثانیه - تبدیل به Long
+            val countdownInterval = 500L // بررسی هر 500 میلی‌ثانیه - تبدیل به Long
+            var remainingTime = countdownTime
             
-            // نمایش پیام واضح‌تر
-            txtMessage.text = "⚠️ محدودیت زمانی کاملاً به پایان رسیده است ⚠️\n\nامکان استفاده از این برنامه تا زمان آزاد شدن محدودیت وجود ندارد."
-            
-            // هشدار صوتی (اگر ممکن باشد)
-            try {
-                val notification = android.media.RingtoneManager.getDefaultUri(android.media.RingtoneManager.TYPE_NOTIFICATION)
-                val ringtone = android.media.RingtoneManager.getRingtone(applicationContext, notification)
-                ringtone.play()
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to play notification sound", e)
+            val countdownHandler = Handler(Looper.getMainLooper())
+            val countdownRunnable = object : Runnable {
+                override fun run() {
+                    remainingTime -= countdownInterval
+                    val secondsLeft = remainingTime / 1000 + 1
+                    
+                    if (secondsLeft > 0) {
+                        txtTimeLimit.text = "برنامه تا ${secondsLeft} ثانیه دیگر بسته می‌شود"
+                        countdownHandler.postDelayed(this, countdownInterval)
+                    }
+                }
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error setting up force lock mode", e)
+            
+            countdownHandler.post(countdownRunnable)
+        } else {
+            // برای حالت عادی کد قبلی
+            txtTitle.setTextColor(resources.getColor(android.R.color.holo_red_dark))
+            txtMessage.setTextColor(resources.getColor(android.R.color.holo_red_dark))
+            
+            // نمایش بولد‌تر پیام
+            txtTitle.textSize = 24f
+            txtMessage.textSize = 18f
         }
     }
     
@@ -567,5 +618,125 @@ class AppLockOverlayActivity : Activity() {
         } catch (e: Exception) {
             Log.e("AppLockOverlay", "خطا در پخش صدای هشدار: ${e.message}")
         }
+    }
+    
+    // پخش صدای هشدار برای جلب توجه کاربر
+    private fun playLockSound() {
+        try {
+            if (mediaPlayer == null) {
+                // استفاده از صدای پیش‌فرض سیستم به جای منبع نامعتبر
+                val notification = android.media.RingtoneManager.getDefaultUri(android.media.RingtoneManager.TYPE_NOTIFICATION)
+                mediaPlayer = MediaPlayer.create(this, notification)
+                mediaPlayer?.setOnCompletionListener {
+                    it.release()
+                    mediaPlayer = null
+                }
+                mediaPlayer?.start()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error playing lock sound", e)
+        }
+    }
+    
+    // ویبره برای جلب توجه بیشتر
+    private fun vibrateForAttention() {
+        try {
+            vibrator?.let { v ->
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    v.vibrate(VibrationEffect.createOneShot(500, VibrationEffect.DEFAULT_AMPLITUDE))
+                } else {
+                    @Suppress("DEPRECATION")
+                    v.vibrate(500)
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error vibrating", e)
+        }
+    }
+
+    // متد goHome که به جای goToHomeScreen استفاده می‌شود
+    private fun goHome() {
+        try {
+            // ارسال کاربر به صفحه اصلی
+            val homeIntent = Intent(Intent.ACTION_MAIN).apply {
+                addCategory(Intent.CATEGORY_HOME)
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+            }
+            startActivity(homeIntent)
+            
+            // بستن برنامه هدف به صورت اجباری اگر هنوز باز است
+            if (packageName != null) {
+                forceCloseLockedApp(packageName!!)
+            }
+            
+            // بستن صفحه قفل بعد از هدایت به صفحه اصلی
+            finish()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error going to home screen", e)
+            
+            // تلاش مجدد با روش قدیمی‌تر در صورت خطا
+            try {
+                val homeIntent = Intent(Intent.ACTION_MAIN)
+                homeIntent.addCategory(Intent.CATEGORY_HOME)
+                homeIntent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                startActivity(homeIntent)
+                finish()
+            } catch (e2: Exception) {
+                Log.e(TAG, "Error in fallback home method", e2)
+            }
+        }
+    }
+
+    private fun updateUI() {
+        try {
+            // تنظیم عنوان و پیام
+            txtTitle.text = "محدودیت زمانی"
+            txtMessage.text = "زمان استفاده شما به پایان رسیده است. لطفاً فردا دوباره تلاش کنید."
+            
+            // نمایش زمان باقیمانده
+            val hours = timeLimitMinutes / 60
+            val minutes = timeLimitMinutes % 60
+            val timeText = if (hours > 0) {
+                "$hours ساعت و $minutes دقیقه"
+            } else {
+                "$minutes دقیقه"
+            }
+            txtTimeLimit.text = "محدودیت: $timeText"
+            
+            // نمایش نام برنامه
+            if (packageName != null) {
+                val appName = getAppName(packageName!!)
+                txtAppName.text = appName
+                
+                // نمایش آیکون برنامه
+                try {
+                    val pm = packageManager
+                    val appInfo = pm.getApplicationInfo(packageName!!, 0)
+                    imgAppIcon.setImageDrawable(appInfo.loadIcon(pm))
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error loading app icon", e)
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error updating UI", e)
+        }
+    }
+
+    private fun getAppName(packageName: String): String {
+        try {
+            val packageManager = packageManager
+            val appInfo = packageManager.getApplicationInfo(packageName, 0)
+            return packageManager.getApplicationLabel(appInfo).toString()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error getting app name", e)
+            return packageName
+        }
+    }
+
+    private fun disableHardwareButtons() {
+        // جلوگیری از پردازش کلیدهای سخت‌افزاری
+        window.addFlags(WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE)
+        window.addFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
+        window.addFlags(WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM)
     }
 } 

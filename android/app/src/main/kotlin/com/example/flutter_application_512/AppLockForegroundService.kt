@@ -339,4 +339,60 @@ class AppLockForegroundService : Service() {
             }
         }
     }
+    
+    private fun checkAndLockApps() {
+        try {
+            val currentTime = System.currentTimeMillis()
+            val timeLimitsJson = prefs.getString(AppLockAccessibilityService.TIME_LIMITS_KEY, "{}")
+            val timeLimits = JSONObject(timeLimitsJson ?: "{}")
+            
+            // بررسی تمام برنامه‌های با محدودیت زمانی
+            val iterator = timeLimits.keys()
+            while (iterator.hasNext()) {
+                val packageName = iterator.next()
+                val limitInMinutes = timeLimits.getLong(packageName)
+                
+                // اگر برنامه قفل شده است و محدودیت زمانی دارد
+                if (isAppLocked(packageName) && limitInMinutes > 0) {
+                    // بررسی زمان استفاده
+                    val usageTime = getAppUsageTime(packageName)
+                    val limitMs = limitInMinutes * 60 * 1000
+                    
+                    // اگر زمان استفاده از حد مجاز بیشتر شده است
+                    if (usageTime >= limitMs) {
+                        // نمایش پیام و هدایت به صفحه اصلی
+                        val intent = Intent(this, AppLockOverlayActivity::class.java)
+                        intent.putExtra("package_name", packageName)
+                        intent.putExtra("time_limit", limitInMinutes)
+                        intent.putExtra("showInApp", true)
+                        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        startActivity(intent)
+                        
+                        // هدایت به صفحه اصلی
+                        val homeIntent = Intent(Intent.ACTION_MAIN)
+                        homeIntent.addCategory(Intent.CATEGORY_HOME)
+                        homeIntent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                        startActivity(homeIntent)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error checking and locking apps", e)
+        }
+    }
+
+    private fun isAppLocked(packageName: String): Boolean {
+        return prefs.getBoolean("app_locked_$packageName", false)
+    }
+
+    private fun getAppUsageTime(packageName: String): Long {
+        try {
+            val usageDataJson = prefs.getString(AppLockAccessibilityService.APP_USAGE_DATA_KEY, "{}")
+            val usageData = JSONObject(usageDataJson ?: "{}")
+            return if (usageData.has(packageName)) usageData.getLong(packageName) else 0
+        } catch (e: Exception) {
+            Log.e(TAG, "Error getting app usage time", e)
+            return 0
+        }
+    }
 } 

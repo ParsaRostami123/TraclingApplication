@@ -32,6 +32,8 @@ import android.os.Bundle
 import android.app.AlarmManager
 import android.app.PendingIntent
 import org.json.JSONArray
+import io.flutter.plugin.common.MethodCall
+import io.flutter.plugin.common.MethodChannel.Result
 
 class MainActivity: FlutterActivity() {
     private val CHANNEL = "com.example.flutter_application_512/usage_stats"
@@ -105,14 +107,7 @@ class MainActivity: FlutterActivity() {
                     result.success(true)
                 }
                 "setAppTimeLimit" -> {
-                    val packageName = call.argument<String>("packageName")
-                    val limitMinutes = call.argument<Int>("limitMinutes")
-                    
-                    if (packageName != null && limitMinutes != null) {
-                        setAppTimeLimit(packageName, limitMinutes.toLong(), result)
-                    } else {
-                        result.error("INVALID_ARGUMENTS", "Package name and limit minutes are required", null)
-                    }
+                    setAppTimeLimit(call, result)
                 }
                 "removeAppTimeLimit" -> {
                     val packageName = call.argument<String>("packageName")
@@ -203,6 +198,17 @@ class MainActivity: FlutterActivity() {
                         result.error("INVALID_ARGUMENTS", "Package name is required", null)
                     }
                 }
+                "testAppLock" -> {
+                    val packageName = call.argument<String>("packageName")
+                    val testType = call.argument<String>("testType") ?: "full"
+                    
+                    if (packageName != null) {
+                        testAppLock(packageName, testType)
+                        result.success(true)
+                    } else {
+                        result.error("INVALID_ARGUMENTS", "Package name is required", null)
+                    }
+                }
                 "unlockApp" -> {
                     val packageName = call.argument<String>("packageName")
                     if (packageName != null) {
@@ -218,6 +224,15 @@ class MainActivity: FlutterActivity() {
                     } catch (e: Exception) {
                         Log.e(TAG, "Error enforcing app locks", e)
                         result.error("ERROR", "Failed to enforce app locks", e.message)
+                    }
+                }
+                "forceAppLock" -> {
+                    val packageName = call.argument<String>("packageName")
+                    if (packageName != null) {
+                        forceAppLockDirect(packageName)
+                        result.success(true)
+                    } else {
+                        result.error("INVALID_ARGUMENTS", "Package name is required", null)
                     }
                 }
                 else -> {
@@ -681,65 +696,33 @@ class MainActivity: FlutterActivity() {
 
     private fun getCurrentForegroundApp(): String? {
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                val usageStatsManager = context.getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
-                
-                // زمان حال و 10 ثانیه قبل
-                val endTime = System.currentTimeMillis()
-                val beginTime = endTime - 10 * 1000 // 10 seconds ago
-                
-                // دریافت رویدادهای اخیر
-                var currentApp: String? = null
-                
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                    val events = usageStatsManager.queryEvents(beginTime, endTime)
-                    val event = UsageEvents.Event()
-                    
-                    // بررسی آخرین رویداد foreground
-                    var lastEventPackageName: String? = null
-                    var lastEventTimeStamp: Long = 0
-                    
-                    while (events.hasNextEvent()) {
-                        events.getNextEvent(event)
-                        if (event.eventType == UsageEvents.Event.MOVE_TO_FOREGROUND) {
-                            // به جای تغییر دادن ویژگی‌های رویداد، مقادیر را در متغیرهای جداگانه ذخیره می‌کنیم
-                            lastEventPackageName = event.packageName
-                            lastEventTimeStamp = event.timeStamp
-                        }
-                    }
-                    
-                    if (lastEventPackageName != null) {
-                        currentApp = lastEventPackageName
-                        Log.d(TAG, "Current foreground app: $currentApp at $lastEventTimeStamp")
-                    }
-                } else {
-                    // برای نسخه‌های قدیمی‌تر، از روش دریافت استتیستیک استفاده می‌کنیم
-                    val stats = usageStatsManager.queryUsageStats(
-                        UsageStatsManager.INTERVAL_DAILY, beginTime, endTime)
-                    
-                    if (stats.isNotEmpty()) {
-                        var lastUsedApp: UsageStats? = null
-                        
-                        for (usageStats in stats) {
-                            if (lastUsedApp == null || usageStats.lastTimeUsed > lastUsedApp.lastTimeUsed) {
-                                lastUsedApp = usageStats
-                            }
-                        }
-                        
-                        if (lastUsedApp != null) {
-                            currentApp = lastUsedApp.packageName
-                            Log.d(TAG, "Current foreground app (older method): $currentApp")
-                        }
-                    }
-                }
-                
-                return currentApp
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) {
+                return null
             }
+            
+            val usageStatsManager = getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
+            
+            val time = System.currentTimeMillis()
+            val events = usageStatsManager.queryEvents(time - 5000, time)
+            val event = UsageEvents.Event()
+            
+            var lastEventPackage: String? = null
+            var lastEventTime = 0L
+            
+            while (events.hasNextEvent()) {
+                events.getNextEvent(event)
+                if (event.eventType == UsageEvents.Event.MOVE_TO_FOREGROUND && 
+                    event.timeStamp > lastEventTime) {
+                    lastEventPackage = event.packageName
+                    lastEventTime = event.timeStamp
+                }
+            }
+            
+            return lastEventPackage
         } catch (e: Exception) {
-            Log.e(TAG, "Error getting current foreground app", e)
+            Log.e(TAG, "خطا در دریافت برنامه فعال: ${e.message}")
+            return null
         }
-        
-        return null
     }
 
     private fun returnToHomeScreen() {
@@ -753,52 +736,94 @@ class MainActivity: FlutterActivity() {
         }
     }
 
-    private fun setAppTimeLimit(packageName: String, limitMinutes: Long, result: MethodChannel.Result? = null) {
+    private fun setAppTimeLimit(call: MethodCall, result: Result) {
         try {
-            val prefs = getSharedPreferences(AppLockAccessibilityService.PREFS_NAME, Context.MODE_PRIVATE)
+            val packageName = call.argument<String>("packageName")
+            val limitMinutes = call.argument<Int>("limitMinutes")
+            
+            if (packageName == null || limitMinutes == null) {
+                result.error("INVALID_ARGUMENTS", "Package name and limit minutes are required", null)
+                return
+            }
+            
+            // ذخیره محدودیت زمانی در تنظیمات مشترک
             val timeLimitsJson = prefs.getString(AppLockAccessibilityService.TIME_LIMITS_KEY, "{}")
             val timeLimits = JSONObject(timeLimitsJson ?: "{}")
             
-            // تنظیم محدودیت زمانی جدید
-            timeLimits.put(packageName, limitMinutes)
+            // اضافه کردن/به‌روزرسانی محدودیت برای این اپلیکیشن
+            timeLimits.put(packageName, limitMinutes.toLong())
             
-            // ذخیره محدودیت‌های به‌روز شده
-            val saveSuccess = prefs.edit().putString(AppLockAccessibilityService.TIME_LIMITS_KEY, timeLimits.toString()).commit()
+            prefs.edit().putString(AppLockAccessibilityService.TIME_LIMITS_KEY, timeLimits.toString()).apply()
             
-            if (saveSuccess) {
-                Log.d(TAG, "Successfully saved time limit for $packageName")
-                
-                // Reset usage data for this app to start fresh time tracking
-                resetAppUsageData(packageName)
-                
-                // پاک کردن وضعیت قفل قبلی برای این برنامه
-                setAppLockStatus(packageName, false)
-                
-                // Ensure accessibility service is running
-                if (!AppLockAccessibilityService.isServiceRunning) {
-                    Log.w(TAG, "Accessibility service not running, prompting user")
-                    openAccessibilitySettings()
-                }
-                
-                // ارسال برودکست برای اطلاع‌رسانی تنظیم محدودیت زمانی
-                val intent = Intent("com.example.flutter_application_512.TIME_LIMIT_SET").apply {
-                    putExtra("packageName", packageName)
-                    putExtra("limitMinutes", limitMinutes)
-                }
-                sendBroadcast(intent)
-                Log.d(TAG, "Broadcast sent for time limit set: $packageName")
-                
-                // Start monitoring service
-                startMonitoringService()
-                
-                result?.success(true)
-            } else {
-                Log.e(TAG, "Failed to save time limit for $packageName")
-                result?.error("SAVE_FAILED", "Could not save time limit for $packageName", null)
-            }
+            // اضافه کردن به لیست اپلیکیشن‌های تحت نظارت (اگر هنوز نیست)
+            addAppToTracking(packageName)
+            
+            // اطمینان از فعال بودن سرویس دسترسی‌پذیری
+            ensureAccessibilityServiceRunning()
+            
+            // اطمینان از فعال بودن سرویس پیش‌زمینه
+            startAppLockForegroundService()
+            
+            // بررسی فوری برای کنترل محدودیت زمانی
+            checkTimeLimitExceeded(packageName, limitMinutes)
+            
+            Log.d(TAG, "محدودیت زمانی برای $packageName تنظیم شد: $limitMinutes دقیقه")
+            result.success(true)
         } catch (e: Exception) {
-            Log.e(TAG, "Error setting app time limit", e)
-            result?.error("ERROR", "Failed to set app time limit: ${e.message}", null)
+            Log.e(TAG, "خطا در تنظیم محدودیت زمانی: ${e.message}")
+            result.error("TIME_LIMIT_ERROR", "خطا در تنظیم محدودیت زمانی", e.message)
+        }
+    }
+    
+    // بررسی فوری محدودیت زمانی برای اعمال بلافاصله در صورت نیاز
+    private fun checkTimeLimitExceeded(packageName: String, limitMinutes: Int) {
+        try {
+            // بررسی زمان استفاده فعلی
+            val currentUsageData = getCurrentAppUsageTime(packageName)
+            val timeUsedMillis = currentUsageData ?: 0L
+            val limitMillis = limitMinutes * 60 * 1000L
+            
+            Log.d(TAG, "بررسی محدودیت زمانی برای $packageName: استفاده ${timeUsedMillis/1000}s از ${limitMillis/1000}s")
+            
+            // تنها نمایش وضعیت فعلی استفاده و محدودیت، بدون قفل کردن بلافاصله
+            // این به کاربر امکان می‌دهد تا پس از اتمام زمان مجاز، اپلیکیشن قفل شود
+            Log.d(TAG, "محدودیت زمانی تنظیم شد. اپلیکیشن پس از رسیدن به محدودیت قفل خواهد شد")
+            
+            // عدم قفل کردن اپلیکیشن در زمان تنظیم محدودیت، حتی اگر زمان از محدودیت گذشته باشد
+            // اپلیکیشن فقط پس از رسیدن به محدودیت در استفاده‌های بعدی قفل خواهد شد
+        } catch (e: Exception) {
+            Log.e(TAG, "خطا در بررسی محدودیت زمانی: ${e.message}")
+        }
+    }
+    
+    // دریافت زمان استفاده فعلی از یک اپلیکیشن
+    private fun getCurrentAppUsageTime(packageName: String): Long? {
+        try {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) {
+                return null
+            }
+            
+            val usageStatsManager = getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
+            
+            val endTime = System.currentTimeMillis()
+            val startTime = endTime - 24 * 60 * 60 * 1000 // 24 ساعت قبل
+            
+            val usageStats = usageStatsManager.queryUsageStats(
+                UsageStatsManager.INTERVAL_DAILY,
+                startTime,
+                endTime
+            )
+            
+            for (stat in usageStats) {
+                if (stat.packageName == packageName) {
+                    return stat.totalTimeInForeground
+                }
+            }
+            
+            return 0
+        } catch (e: Exception) {
+            Log.e(TAG, "خطا در دریافت زمان استفاده: ${e.message}")
+            return null
         }
     }
 
@@ -845,28 +870,6 @@ class MainActivity: FlutterActivity() {
         } catch (e: Exception) {
             Log.e(TAG, "Error resetting app usage data", e)
             throw e
-        }
-    }
-
-    private fun resetAppUsageData(packageName: String) {
-        try {
-            val prefs = applicationContext.getSharedPreferences("AppLockPrefs", Context.MODE_PRIVATE)
-            val usageDataJson = prefs.getString("app_usage_data", "{}")
-            val usageData = JSONObject(usageDataJson ?: "{}")
-            
-            // پاک کردن داده‌های استفاده برای این برنامه
-            if (usageData.has(packageName)) {
-                usageData.put(packageName, 0)
-            }
-            
-            prefs.edit().putString("app_usage_data", usageData.toString()).apply()
-            
-            // همچنین وضعیت قفل برنامه را پاک می‌کنیم
-            prefs.edit().putBoolean("app_locked_$packageName", false).apply()
-            
-            Log.d(TAG, "Reset usage data for $packageName")
-        } catch (e: Exception) {
-            Log.e(TAG, "Error resetting app usage data for $packageName", e)
         }
     }
 
@@ -1077,7 +1080,7 @@ class MainActivity: FlutterActivity() {
     }
 
     // مدیریت وضعیت قفل برنامه
-    private fun setAppLockStatus(packageName: String, isLocked: Boolean, result: MethodChannel.Result? = null) {
+    private fun setAppLockStatus(packageName: String, isLocked: Boolean, result: Result? = null) {
         try {
             val prefs = applicationContext.getSharedPreferences("AppLockPrefs", Context.MODE_PRIVATE)
             prefs.edit().putBoolean("app_locked_$packageName", isLocked).apply()
@@ -1099,7 +1102,7 @@ class MainActivity: FlutterActivity() {
         }
     }
 
-    private fun unlockApp(packageName: String, result: MethodChannel.Result? = null) {
+    private fun unlockApp(packageName: String, result: Result? = null) {
         try {
             setAppLockStatus(packageName, false)
             
@@ -1177,6 +1180,127 @@ class MainActivity: FlutterActivity() {
         } catch (e: Exception) {
             Log.e(TAG, "Error enforcing app locks", e)
             throw e
+        }
+    }
+
+    // اضافه کردن اپلیکیشن به لیست برنامه‌های تحت نظارت
+    private fun addAppToTracking(packageName: String) {
+        try {
+            val trackingAppsJson = prefs.getString(AppLockAccessibilityService.TRACKING_APPS_KEY, "[]")
+            val trackingApps = JSONArray(trackingAppsJson ?: "[]")
+            
+            // بررسی تکراری نبودن
+            var alreadyTracked = false
+            for (i in 0 until trackingApps.length()) {
+                if (trackingApps.getString(i) == packageName) {
+                    alreadyTracked = true
+                    break
+                }
+            }
+            
+            // اضافه کردن به لیست اگر قبلاً نبوده
+            if (!alreadyTracked) {
+                trackingApps.put(packageName)
+                prefs.edit().putString(AppLockAccessibilityService.TRACKING_APPS_KEY, trackingApps.toString()).apply()
+                Log.d(TAG, "برنامه $packageName به لیست نظارت اضافه شد")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "خطا در اضافه کردن برنامه به لیست نظارت: ${e.message}")
+        }
+    }
+
+    private fun startAppLockForegroundService() {
+        try {
+            val serviceIntent = Intent(this, AppLockForegroundService::class.java)
+            serviceIntent.action = AppLockForegroundService.ACTION_START_SERVICE
+            
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(serviceIntent)
+            } else {
+                startService(serviceIntent)
+            }
+            
+            Log.d(TAG, "Started app lock foreground service")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error starting app lock foreground service", e)
+        }
+    }
+
+    private fun testAppLock(packageName: String, testType: String) {
+        Log.d(TAG, "Testing app lock functionality for $packageName with test type: $testType")
+        
+        val tester = AppLockTester(this)
+        
+        when (testType) {
+            "kill" -> {
+                Log.d(TAG, "Running kill app test")
+                tester.testKillApp(packageName)
+            }
+            "lock" -> {
+                Log.d(TAG, "Running lock app test")
+                tester.testLockApp(packageName)
+            }
+            "screen" -> {
+                Log.d(TAG, "Running lock screen test")
+                tester.testShowLockScreen(packageName)
+            }
+            else -> {
+                Log.d(TAG, "Running full lock sequence test")
+                tester.testFullLockSequence(packageName)
+            }
+        }
+    }
+
+    private fun forceAppLockDirect(packageName: String) {
+        try {
+            Log.d(TAG, "Requesting force app lock for $packageName")
+            
+            // 1. اضافه کردن به لیست برنامه‌های قفل شده
+            val prefs = applicationContext.getSharedPreferences("AppLockPrefs", Context.MODE_PRIVATE)
+            val lockedAppsJson = prefs.getString("locked_apps", "[]")
+            
+            // تبدیل به آرایه و اضافه کردن برنامه جدید
+            val lockedApps = JSONArray(lockedAppsJson ?: "[]")
+            
+            // بررسی تکراری نبودن
+            var alreadyLocked = false
+            for (i in 0 until lockedApps.length()) {
+                if (lockedApps.getString(i) == packageName) {
+                    alreadyLocked = true
+                    break
+                }
+            }
+            
+            if (!alreadyLocked) {
+                lockedApps.put(packageName)
+                prefs.edit().putString("locked_apps", lockedApps.toString()).apply()
+                Log.d(TAG, "Added $packageName to locked apps list")
+            }
+            
+            // 2. ارسال رویداد به سرویس
+            val intent = Intent("com.example.flutter_application_512.APP_LOCKED").apply {
+                putExtra("packageName", packageName)
+                putExtra("targetPackage", packageName)
+                putExtra("fromMainActivity", true)
+            }
+            sendBroadcast(intent)
+            
+            // 3. ارسال دستور بستن برنامه
+            val closeIntent = Intent("com.example.flutter_application_512.FORCE_CLOSE_APP").apply {
+                putExtra("packageName", packageName)
+            }
+            sendBroadcast(closeIntent)
+            
+            Log.d(TAG, "Force app lock completed for $packageName")
+            
+            // 4. بازگشت به صفحه اصلی
+            val homeIntent = Intent(Intent.ACTION_MAIN).apply {
+                addCategory(Intent.CATEGORY_HOME)
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            }
+            startActivity(homeIntent)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error in forceAppLockDirect", e)
         }
     }
 }

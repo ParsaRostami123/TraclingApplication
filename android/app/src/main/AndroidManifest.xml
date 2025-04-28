@@ -49,6 +49,24 @@
             android:showWhenLocked="true"
             android:turnScreenOn="true">
         </activity>
+        <!-- Lock Screen Activity -->
+        <activity
+            android:name=".LockScreenActivity"
+            android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:launchMode="singleInstance"
+            android:showOnLockScreen="true"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true"
+            android:taskAffinity=""
+            android:configChanges="orientation|keyboardHidden|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+            android:hardwareAccelerated="true">
+            <intent-filter android:priority="1000">
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
         <!-- App Lock Accessibility Service -->
         <service
             android:name=".AppLockAccessibilityService"
