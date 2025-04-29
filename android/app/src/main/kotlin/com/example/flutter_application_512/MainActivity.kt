@@ -198,6 +198,41 @@ class MainActivity: FlutterActivity() {
                         result.error("INVALID_ARGUMENTS", "Package name is required", null)
                     }
                 }
+                "lockApp" -> {
+                    val packageName = call.argument<String>("packageName")
+                    if (packageName != null) {
+                        lockApp(packageName)
+                        result.success(true)
+                    } else {
+                        result.error("INVALID_ARGUMENTS", "Package name is required", null)
+                    }
+                }
+                "showLockScreen" -> {
+                    val packageName = call.argument<String>("packageName")
+                    val appName = call.argument<String>("appName") ?: ""
+                    val timeLimit = call.argument<Int>("timeLimit") ?: 0
+                    val usedTime = call.argument<Int>("usedTime") ?: 0
+                    
+                    if (packageName != null) {
+                        showLockScreen(packageName, appName, timeLimit, usedTime)
+                        result.success(true)
+                    } else {
+                        result.error("INVALID_ARGUMENTS", "Package name is required", null)
+                    }
+                }
+                "forceCloseApp" -> {
+                    val packageName = call.argument<String>("packageName")
+                    if (packageName != null) {
+                        forceCloseApp(packageName)
+                        result.success(true)
+                    } else {
+                        result.error("INVALID_ARGUMENTS", "Package name is required", null)
+                    }
+                }
+                "enforceAppLocks" -> {
+                    enforceAppLocks()
+                    result.success(true)
+                }
                 "testAppLock" -> {
                     val packageName = call.argument<String>("packageName")
                     val testType = call.argument<String>("testType") ?: "full"
@@ -215,15 +250,6 @@ class MainActivity: FlutterActivity() {
                         unlockApp(packageName, result)
                     } else {
                         result.error("INVALID_ARGUMENTS", "Package name is required", null)
-                    }
-                }
-                "enforceAppLocks" -> {
-                    try {
-                        enforceAllAppLocks()
-                        result.success(true)
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Error enforcing app locks", e)
-                        result.error("ERROR", "Failed to enforce app locks", e.message)
                     }
                 }
                 "forceAppLock" -> {
@@ -1301,6 +1327,92 @@ class MainActivity: FlutterActivity() {
             startActivity(homeIntent)
         } catch (e: Exception) {
             Log.e(TAG, "Error in forceAppLockDirect", e)
+        }
+    }
+
+    // قفل کردن برنامه (افزودن به لیست برنامه‌های قفل شده)
+    private fun lockApp(packageName: String) {
+        try {
+            // ذخیره در Shared Preferences
+            prefs = getSharedPreferences(AppLockAccessibilityService.PREFS_NAME, Context.MODE_PRIVATE)
+            
+            // دریافت لیست فعلی برنامه‌های قفل شده
+            val lockedAppsJson = prefs.getString(AppLockAccessibilityService.LOCKED_APPS_KEY, "[]")
+            val lockedApps = JSONArray(lockedAppsJson ?: "[]")
+            
+            // بررسی تکراری بودن
+            var alreadyLocked = false
+            for (i in 0 until lockedApps.length()) {
+                if (lockedApps.getString(i) == packageName) {
+                    alreadyLocked = true
+                    break
+                }
+            }
+            
+            // اگر تکراری نیست، اضافه کن
+            if (!alreadyLocked) {
+                lockedApps.put(packageName)
+                prefs.edit().putString(AppLockAccessibilityService.LOCKED_APPS_KEY, lockedApps.toString()).apply()
+                Log.d(TAG, "🔒 برنامه به لیست قفل‌ها اضافه شد: $packageName")
+            }
+            
+            // ارسال یک broadcast به سرویس Accessibility برای اعمال قفل
+            val intent = Intent("com.example.flutter_application_512.APP_LOCKED")
+            intent.putExtra("packageName", packageName)
+            intent.putExtra("targetPackage", packageName)
+            sendBroadcast(intent)
+            
+            Log.d(TAG, "Broadcast sent to lock app: $packageName")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error locking app: $e")
+        }
+    }
+    
+    // نمایش صفحه قفل برای برنامه
+    private fun showLockScreen(packageName: String, appName: String, timeLimit: Int, usedTime: Int) {
+        try {
+            val lockIntent = Intent(this, LockScreenActivity::class.java)
+            lockIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            lockIntent.putExtra("package_name", packageName)
+            lockIntent.putExtra("app_name", appName)
+            lockIntent.putExtra("time_limit", timeLimit)
+            lockIntent.putExtra("used_time", usedTime)
+            startActivity(lockIntent)
+            
+            Log.d(TAG, "Showing lock screen for: $packageName")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error showing lock screen: $e")
+        }
+    }
+    
+    // بستن اجباری برنامه
+    private fun forceCloseApp(packageName: String) {
+        try {
+            // ارسال یک broadcast به سرویس Accessibility برای بستن اجباری برنامه
+            val intent = Intent("com.example.flutter_application_512.FORCE_CLOSE_APP")
+            intent.putExtra("packageName", packageName)
+            sendBroadcast(intent)
+            
+            Log.d(TAG, "Broadcast sent to force close app: $packageName")
+            
+            // برای اطمینان بیشتر، به اسکرین هوم هم برویم
+            returnToHomeScreen()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error force closing app: $e")
+        }
+    }
+    
+    // اعمال قفل برای همه برنامه‌های قفل شده
+    private fun enforceAppLocks() {
+        try {
+            // ارسال broadcast به سرویس Accessibility برای بررسی همه برنامه‌های قفل شده
+            val intent = Intent(AppLockAccessibilityService.SERVICE_RESTART_ACTION)
+            intent.putExtra("enforceLockedApps", true)
+            sendBroadcast(intent)
+            
+            Log.d(TAG, "Broadcast sent to enforce all app locks")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error enforcing app locks: $e")
         }
     }
 }

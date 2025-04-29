@@ -24,6 +24,7 @@ import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
 import java.util.Calendar
 import com.google.gson.Gson
+import android.app.usage.UsageEvents
 
 class AppLockAccessibilityService : AccessibilityService() {
     
@@ -41,6 +42,8 @@ class AppLockAccessibilityService : AccessibilityService() {
     private val currentDayUsage = ConcurrentHashMap<String, Long>() // Thread-safe map
     private var appLockReceiver: BroadcastReceiver? = null
     private val TAG = "AppLockService"
+    private var timeCheckRunnable: Runnable? = null
+    private val TIME_CHECK_INTERVAL = 1000L // چک کردن هر ثانیه
     
     // لیست اپ‌های اجتماعی با اولویت بالا - باید به طور ویژه کنترل شوند
     private val prioritySocialApps = setOf(
@@ -111,6 +114,8 @@ class AppLockAccessibilityService : AccessibilityService() {
         if (DEBUG) {
             Toast.makeText(this, "سرویس قفل برنامه با حالت پیشرفته فعال شد", Toast.LENGTH_LONG).show()
         }
+        
+        startTimeChecker()
     }
     
     private fun configureService() {
@@ -682,23 +687,21 @@ class AppLockAccessibilityService : AccessibilityService() {
             val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
             am.killBackgroundProcesses(packageName)
             
-            // نمایش صفحه قفل در برنامه هدف
+            // ایجاد intent برای نمایش overlay
             val intent = Intent(this, AppLockOverlayActivity::class.java).apply {
-                putExtra("package_name", packageName)
+                putExtra(AppLockOverlayActivity.EXTRA_PACKAGE_NAME, packageName)
+                putExtra(AppLockOverlayActivity.EXTRA_APP_NAME, getAppName(packageName))
+                putExtra(AppLockOverlayActivity.EXTRA_TIME_USED, getTimeUsed(packageName))
+                putExtra(AppLockOverlayActivity.EXTRA_TIME_LIMIT, getTimeLimit(packageName))
+                putExtra("forceLock", true)
                 putExtra("showInApp", true)
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                setPackage(packageName) // این خط مهم است - باعث می‌شود صفحه قفل در برنامه هدف نمایش داده شود
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or 
+                        Intent.FLAG_ACTIVITY_NO_ANIMATION or
+                        Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
             }
             
-            // تلاش برای نمایش صفحه قفل در برنامه هدف
-            try {
-                startActivity(intent)
-            } catch (e: Exception) {
-                Log.e(TAG, "Error showing lock screen in target app", e)
-                // اگر نمایش در برنامه هدف موفق نبود، در برنامه خودمان نمایش بده
-                intent.setPackage(null)
-                startActivity(intent)
-            }
+            // اجرای overlay
+            startActivity(intent)
             
             // هدایت به صفحه اصلی
             val homeIntent = Intent(Intent.ACTION_MAIN).apply {
@@ -717,55 +720,21 @@ class AppLockAccessibilityService : AccessibilityService() {
      */
     private fun showOverlayInApp(packageName: String) {
         try {
-            val appName = getAppName(packageName)
-            // دریافت زمان استفاده
-            val timeUsedMinutes = currentDayUsage.getOrDefault(packageName, 0L) / (60 * 1000)
-            // دریافت محدودیت زمانی
-            val timeLimitsJson = prefs.getString(TIME_LIMITS_KEY, "{}")
-            val timeLimits = JSONObject(timeLimitsJson ?: "{}")
-            val timeLimitMinutes = if (timeLimits.has(packageName)) timeLimits.getLong(packageName) else 0
-            
-            // ذخیره اطلاعات برنامه قفل شده
-            prefs.edit().apply {
-                putString("last_locked_app", packageName)
-                putString("last_locked_app_name", appName)
-                putLong("lock_time", System.currentTimeMillis())
-                apply()
-            }
-            
-            // نمایش توست اولیه برای اطلاع‌رسانی سریع
-            handler.post {
-                try {
-                    Toast.makeText(
-                        applicationContext,
-                        "$appName قفل شده است - زمان استفاده به پایان رسیده",
-                        Toast.LENGTH_LONG
-                    ).show()
-                } catch (e: Exception) {
-                    // خطای توست را نادیده بگیر
+            // نمایش صفحه قفل به عنوان Overlay
+            val intent = Intent(this, AppLockOverlayActivity::class.java).apply {
+                putExtra("package_name", packageName)
+                putExtra("showInApp", true)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                // تنظیم نوع پنجره به عنوان Overlay
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    addFlags(Intent.FLAG_ACTIVITY_LAUNCH_ADJACENT)
                 }
             }
             
-            // نمایش اورلی داخل برنامه با تنظیمات مخصوص
-            val lockIntent = Intent(this, AppLockOverlayActivity::class.java).apply {
-                flags = Intent.FLAG_ACTIVITY_NEW_TASK or 
-                        Intent.FLAG_ACTIVITY_CLEAR_TOP or
-                        Intent.FLAG_ACTIVITY_NO_ANIMATION
-                
-                // ارسال اطلاعات به اکتیویتی
-                putExtra("packageName", packageName)
-                putExtra("appName", appName)
-                putExtra("timeUsed", timeUsedMinutes)
-                putExtra("timeLimit", timeLimitMinutes)
-                putExtra("showInApp", true)  // فلگ جدید برای نمایش داخل برنامه
-                putExtra("showFirst", true)  // نمایش اولیه
-            }
-            
-            startActivity(lockIntent)
-            Log.d(TAG, "✅ صفحه قفل داخل برنامه برای $packageName نمایش داده شد")
-            
+            // نمایش Overlay
+            startActivity(intent)
         } catch (e: Exception) {
-            Log.e(TAG, "خطا در نمایش اورلی داخل برنامه: ${e.message}")
+            Log.e(TAG, "Error showing overlay", e)
         }
     }
     
@@ -1382,10 +1351,11 @@ class AppLockAccessibilityService : AccessibilityService() {
     
     private fun getAppName(packageName: String): String {
         try {
-            val packageManager = applicationContext.packageManager
+            val packageManager = packageManager
             val appInfo = packageManager.getApplicationInfo(packageName, 0)
             return packageManager.getApplicationLabel(appInfo).toString()
-        } catch (e: PackageManager.NameNotFoundException) {
+        } catch (e: Exception) {
+            Log.e(TAG, "Error getting app name", e)
             return packageName
         }
     }
@@ -1680,6 +1650,8 @@ class AppLockAccessibilityService : AccessibilityService() {
         val restartIntent = Intent(SERVICE_RESTART_ACTION)
         sendBroadcast(restartIntent)
         
+        stopTimeChecker()
+        
         super.onDestroy()
     }
     
@@ -1792,5 +1764,138 @@ class AppLockAccessibilityService : AccessibilityService() {
     // Check if the app is running
     private fun checkIfAppIsRunning(packageName: String): Boolean {
         return isAppRunningAdvanced(packageName)
+    }
+
+    private fun getTimeUsed(packageName: String): Long {
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        return prefs.getLong("${packageName}_time_used", 0)
+    }
+
+    private fun getTimeLimit(packageName: String): Long {
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        return prefs.getLong("${packageName}_time_limit", 0)
+    }
+    
+    private fun startTimeChecker() {
+        stopTimeChecker() // ابتدا چک کننده قبلی را متوقف کن
+        
+        timeCheckRunnable = Runnable {
+            checkAllAppsTime()
+            handler.postDelayed(timeCheckRunnable!!, TIME_CHECK_INTERVAL)
+        }
+        
+        handler.post(timeCheckRunnable!!)
+    }
+
+    private fun stopTimeChecker() {
+        if (timeCheckRunnable != null) {
+            handler.removeCallbacks(timeCheckRunnable!!)
+            timeCheckRunnable = null
+        }
+    }
+
+    private fun checkAllAppsTime() {
+        try {
+            val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val allApps = prefs.all
+            
+            for ((key, value) in allApps) {
+                if (key.endsWith("_time_used")) {
+                    val packageName = key.removeSuffix("_time_used")
+                    val timeUsed = value as Long
+                    val timeLimit = prefs.getLong("${packageName}_time_limit", 0)
+                    
+                    if (timeLimit > 0 && timeUsed >= timeLimit) {
+                        // اگر زمان استفاده به حد مجاز رسیده
+                        if (isAppRunning(packageName)) {
+                            Log.d(TAG, "Time limit reached for $packageName, forcing lock")
+                            forceAppLock(packageName)
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error checking app times", e)
+        }
+    }
+
+    private fun updateAppUsageTime(packageName: String, timeIncrement: Long) {
+        try {
+            val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val currentTime = prefs.getLong("${packageName}_time_used", 0)
+            val newTime = currentTime + timeIncrement
+            
+            prefs.edit().putLong("${packageName}_time_used", newTime).apply()
+            
+            // چک کردن محدودیت زمان
+            val timeLimit = prefs.getLong("${packageName}_time_limit", 0)
+            if (timeLimit > 0 && newTime >= timeLimit) {
+                Log.d(TAG, "Time limit reached for $packageName, forcing lock")
+                forceAppLock(packageName)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error updating app usage time", e)
+        }
+    }
+
+    private fun isAppRunning(packageName: String): Boolean {
+        try {
+            val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            
+            // روش 1: بررسی تسک‌های در حال اجرا
+            val tasks = am.getRunningTasks(10)
+            for (task in tasks) {
+                if (task.topActivity?.packageName == packageName) {
+                    return true
+                }
+            }
+            
+            // روش 2: بررسی پروسس‌های در حال اجرا
+            val runningProcesses = am.runningAppProcesses
+            for (processInfo in runningProcesses) {
+                if (processInfo.processName == packageName || processInfo.pkgList.contains(packageName)) {
+                    if (processInfo.importance <= ActivityManager.RunningAppProcessInfo.IMPORTANCE_VISIBLE) {
+                        return true
+                    }
+                }
+            }
+            
+            // روش 3: بررسی آخرین برنامه استفاده شده
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
+                val usageStatsManager = getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
+                val time = System.currentTimeMillis()
+                
+                // بررسی آمار استفاده در 5 ثانیه اخیر
+                val usageStats = usageStatsManager.queryUsageStats(
+                    UsageStatsManager.INTERVAL_DAILY,
+                    time - 5 * 1000,
+                    time
+                )
+                
+                for (stat in usageStats) {
+                    if (stat.packageName == packageName && stat.lastTimeUsed > time - 5000) {
+                        return true
+                    }
+                }
+                
+                // بررسی رویدادهای اخیر
+                val events = usageStatsManager.queryEvents(time - 5000, time)
+                val event = UsageEvents.Event()
+                
+                while (events.hasNextEvent()) {
+                    events.getNextEvent(event)
+                    if (event.packageName == packageName &&
+                        event.timeStamp > time - 5000 && 
+                        event.eventType == UsageEvents.Event.MOVE_TO_FOREGROUND) {
+                        return true
+                    }
+                }
+            }
+            
+            return false
+        } catch (e: Exception) {
+            Log.e(TAG, "Error checking if app is running", e)
+            return false
+        }
     }
 } 

@@ -231,8 +231,8 @@ class _AppListScreenState extends State<AppListScreen> {
 
   // شروع مانیتورینگ برنامه‌های در حال اجرا
   void _startAppMonitoring() {
-    // بررسی هر 10 ثانیه
-    _monitorTimer = Timer.periodic(const Duration(seconds: 10), (timer) {
+    // بررسی هر 3 ثانیه برای واکنش سریع‌تر به اتمام زمان
+    _monitorTimer = Timer.periodic(const Duration(seconds: 3), (timer) {
       if (_hasUsagePermission) {
         _checkRunningApps();
       }
@@ -260,49 +260,43 @@ class _AppListScreenState extends State<AppListScreen> {
           // اگر زمان استفاده از محدودیت بیشتر شده
           if (app.timeLimit.inSeconds > 0 &&
               app.usageDuration >= app.timeLimit) {
-            // نمایش پنجره قفل
-            _showLockScreen(app);
+            print(
+                "محدودیت زمانی ${app.appName} به پایان رسیده. در حال قفل کردن...");
+
+            // فرستادن دستور قفل به سرویس اندروید
+            try {
+              // قفل کردن برنامه با استفاده از سرویس اندروید
+              await _methodChannel.invokeMethod('lockApp', {
+                'packageName': app.packageName,
+              });
+
+              // نمایش صفحه قفل اندروید
+              await _methodChannel.invokeMethod('showLockScreen', {
+                'packageName': app.packageName,
+                'appName': app.appName,
+                'timeLimit': app.timeLimit.inMinutes,
+                'usedTime': app.usageDuration.inMinutes,
+              });
+
+              // اجبار برای بستن برنامه
+              await _methodChannel.invokeMethod('forceCloseApp', {
+                'packageName': app.packageName,
+              });
+
+              // بازگشت به صفحه اصلی
+              await _methodChannel.invokeMethod('returnToHomeScreen');
+
+              // دیگر نیازی به نمایش صفحه قفل داخل برنامه فلاتر نیست
+              // _showLockScreen(app); - این خط حذف شد
+            } catch (e) {
+              print("خطا در قفل کردن برنامه: $e");
+            }
           }
         }
       }
     } catch (e) {
       print("Error checking running apps: $e");
     }
-  }
-
-  // نمایش صفحه قفل
-  void _showLockScreen(AppInfo app) {
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => WillPopScope(
-        onWillPop: () async => false, // غیرفعال کردن دکمه بازگشت
-        child: AlertDialog(
-          title: Text('${app.appName} قفل شده است'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Icon(Icons.lock, size: 48, color: Colors.red),
-              const SizedBox(height: 16),
-              Text('زمان مجاز استفاده از ${app.appName} به پایان رسیده است.'),
-              const SizedBox(height: 8),
-              Text('محدودیت: ${_formatDuration(app.timeLimit)}'),
-              Text('زمان استفاده شده: ${_formatDuration(app.usageDuration)}'),
-            ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () {
-                Navigator.of(context).pop();
-                // بازگشت به برنامه اصلی
-                _methodChannel.invokeMethod('returnToHomeScreen');
-              },
-              child: const Text('بازگشت به صفحه اصلی'),
-            ),
-          ],
-        ),
-      ),
-    );
   }
 
   Future<void> _initApp() async {
@@ -342,6 +336,14 @@ class _AppListScreenState extends State<AppListScreen> {
         await Future.delayed(const Duration(seconds: 2));
         await _methodChannel.invokeMethod('enforceAppLocks');
         print("App locks enforced on startup");
+
+        // شروع مانیتورینگ برنامه‌ها برای کنترل محدودیت زمانی
+        _startAppMonitoring();
+
+        // بررسی فوری برنامه‌های در حال اجرا برای اعمال محدودیت‌ها
+        Future.delayed(const Duration(seconds: 3), () {
+          _checkRunningApps();
+        });
       } catch (e) {
         print("Error initializing app lock: $e");
       }
@@ -681,50 +683,40 @@ class _AppListScreenState extends State<AppListScreen> {
 
   Future<void> _checkServiceStatus() async {
     try {
-      // بررسی وضعیت سرویس‌ها
-      final hasOverlayPermission =
-          await _methodChannel.invokeMethod('checkOverlayPermission');
-      final hasAccessibility =
+      // بررسی خدمات مورد نیاز
+      final accessibilityEnabled =
           await _methodChannel.invokeMethod('checkAccessibilityServiceEnabled');
-
-      // بررسی دقیق‌تر وضعیت سرویس دسترسی‌پذیری
-      final serviceStatus =
+      final overlayPermission =
+          await _methodChannel.invokeMethod('checkOverlayPermission');
+      final serviceRunning =
           await _methodChannel.invokeMethod('checkAccessibilityServiceStatus');
 
       setState(() {
-        _hasOverlayPermission = hasOverlayPermission == true;
-        _hasAccessibilityPermission = hasAccessibility == true;
-
-        // اگر سرویس فعال شده اما در حال اجرا نیست، سعی کنیم دوباره آن را اجرا کنیم
-        if (_hasAccessibilityPermission &&
-            serviceStatus is Map &&
-            serviceStatus['isEnabled'] == true &&
-            serviceStatus['isRunning'] == false) {
-          print(
-              "Accessibility service is enabled but not running. Attempting to restart...");
-          _ensureAccessibilityServiceRunning();
-        }
+        _hasAccessibilityPermission = accessibilityEnabled == true;
+        _hasOverlayPermission = overlayPermission == true;
+        _isMonitoringServiceRunning = serviceRunning == true;
       });
 
-      // ذخیره وضعیت دسترسی‌ها برای جلوگیری از درخواست مجدد
+      print(
+          "Service status - Accessibility: $_hasAccessibilityPermission, Overlay: $_hasOverlayPermission, Running: $_isMonitoringServiceRunning");
+
+      // اگر دسترسی‌های لازم نداشتیم، درخواست کن
+      if (!_hasAccessibilityPermission || !_hasOverlayPermission) {
+        // Schedule permission request
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _requestRequiredPermissions();
+        });
+      }
+      // اگر سرویس مانیتورینگ در حال اجرا نیست، شروع کن
+      else if (!_isMonitoringServiceRunning && _hasUsagePermission) {
+        await _startMonitoringService();
+      }
+
+      // ذخیره وضعیت دسترسی‌ها در حافظه
       final prefs = await _prefs;
-      if (_hasAccessibilityPermission) {
-        await prefs.setBool('accessibility_permission_granted', true);
-      }
-      if (_hasOverlayPermission) {
-        await prefs.setBool('overlay_permission_granted', true);
-      }
-
-      // اگر سرویس‌ها فعال هستند، مانیتورینگ را شروع کن
-      if (_hasAccessibilityPermission &&
-          _hasOverlayPermission &&
-          _hasUsagePermission) {
-        await _methodChannel.invokeMethod('startMonitoringService');
-        _isMonitoringServiceRunning = true;
-
-        // شروع بررسی‌های دوره‌ای
-        _startAppMonitoring();
-      }
+      prefs.setBool(
+          'accessibility_permission_granted', _hasAccessibilityPermission);
+      prefs.setBool('overlay_permission_granted', _hasOverlayPermission);
     } catch (e) {
       print("Error checking service status: $e");
     }
@@ -964,40 +956,57 @@ class _AppListScreenState extends State<AppListScreen> {
       // تبدیل محدودیت زمانی به دقیقه
       final limitInMinutes = limit.inMinutes;
 
-      // ذخیره در نیتیو
+      // ذخیره محدودیت در حافظه محلی
+      final prefs = await _prefs;
+      final timeLimitsJson = prefs.getString('time_limits') ?? '{}';
+      final timeLimits = jsonDecode(timeLimitsJson) as Map<String, dynamic>;
+      timeLimits[app.packageName] = limitInMinutes;
+      await prefs.setString('time_limits', jsonEncode(timeLimits));
+
+      // به‌روزرسانی لیست اپلیکیشن‌ها
+      setState(() {
+        app.timeLimit = limit;
+        _timeLimits[app.packageName] = limit;
+      });
+
+      // فراخوانی متد اندروید برای تنظیم محدودیت زمانی
       await _methodChannel.invokeMethod('setAppTimeLimit', {
         'packageName': app.packageName,
         'limitMinutes': limitInMinutes,
       });
 
-      setState(() {
-        final index = _apps.indexWhere((a) => a.packageName == app.packageName);
-        if (index >= 0) {
-          // ایجاد نسخه جدید از AppInfo با محدودیت زمانی جدید
-          _apps[index] = AppInfo(
-            appName: app.appName,
-            packageName: app.packageName,
-            isSystemApp: app.isSystemApp,
-            icon: app.icon,
-            usageDuration: app.usageDuration,
-            timeLimit: limit,
-          );
-
-          // ذخیره محدودیت در مپ
-          if (limit.inSeconds > 0) {
-            _timeLimits[app.packageName] = limit;
-          } else {
-            _timeLimits.remove(app.packageName);
-          }
-        }
-      });
-
-      // اگر سرویس در حال اجرا نیست، شروع کن
+      // اطمینان از اجرای سرویس مانیتورینگ
       if (!_isMonitoringServiceRunning) {
         await _startMonitoringService();
       }
+
+      // بررسی محدودیت فعلی و اعمال قفل در صورت نیاز
+      await _methodChannel.invokeMethod('enforceAppLocks');
+
+      print(
+          "محدودیت زمانی ${app.appName} به ${_formatDuration(limit)} تنظیم شد");
+
+      // نمایش پیام موفقیت
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+              'محدودیت زمانی ${app.appName} به ${_formatDuration(limit)} تنظیم شد'),
+          backgroundColor: Colors.green[700],
+          behavior: SnackBarBehavior.floating,
+          duration: const Duration(seconds: 3),
+        ),
+      );
     } catch (e) {
-      print("Error setting app time limit: $e");
+      print("خطا در تنظیم محدودیت زمانی: $e");
+
+      // نمایش پیام خطا
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('خطا در تنظیم محدودیت زمانی: $e'),
+          backgroundColor: Colors.red[700],
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
     }
   }
 

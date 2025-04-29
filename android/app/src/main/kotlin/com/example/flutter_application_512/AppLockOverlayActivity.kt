@@ -74,40 +74,34 @@ class AppLockOverlayActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         
-        // دریافت فلگ نمایش داخل برنامه
-        val showInApp = intent.getBooleanExtra("showInApp", false)
-        
-        // تنظیم نمایش تمام صفحه و روی تمام برنامه‌ها
-        if (showInApp) {
-            // تنظیم نوع پنجره برای نمایش روی برنامه‌های دیگر
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                window.setType(WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY)
-            } else {
-                window.setType(WindowManager.LayoutParams.TYPE_SYSTEM_ALERT)
-            }
-            
-            // تنظیمات پنجره برای نمایش روی برنامه‌های دیگر
-            val params = window.attributes.apply {
-                flags = flags or 
-                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
-                    WindowManager.LayoutParams.FLAG_FULLSCREEN or
-                    WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD or
-                    WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
-                    WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
-                dimAmount = 0.7f
-            }
-            window.attributes = params
-            
-            // تنظیم اولویت بالا برای پنجره
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                window.attributes.type = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-            } else {
-                window.attributes.type = WindowManager.LayoutParams.TYPE_SYSTEM_ALERT
-            }
+        // تنظیم نوع پنجره برای نمایش روی تمام برنامه‌ها
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            window.setType(WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY)
+        } else {
+            window.setType(WindowManager.LayoutParams.TYPE_SYSTEM_ALERT)
         }
+        
+        // تنظیمات پنجره برای نمایش روی برنامه‌های دیگر
+        val params = window.attributes.apply {
+            flags = flags or 
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                WindowManager.LayoutParams.FLAG_FULLSCREEN or
+                WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD or
+                WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+                WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON or
+                WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM or
+                WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+            dimAmount = 0.7f
+            gravity = android.view.Gravity.TOP or android.view.Gravity.START
+            x = 0
+            y = 0
+            width = WindowManager.LayoutParams.MATCH_PARENT
+            height = WindowManager.LayoutParams.MATCH_PARENT
+        }
+        window.attributes = params
         
         // تنظیم محتوا
         setContentView(R.layout.activity_app_lock_overlay)
@@ -118,15 +112,11 @@ class AppLockOverlayActivity : Activity() {
         timeUsedMinutes = intent.getLongExtra(EXTRA_TIME_USED, 0)
         timeLimitMinutes = intent.getLongExtra("timeLimit", intent.getLongExtra(EXTRA_TIME_LIMIT, 0))
         val forceLock = intent.getBooleanExtra("forceLock", false)
-        val showFirst = intent.getBooleanExtra("showFirst", false) // دریافت فلگ جدید
+        val showInApp = intent.getBooleanExtra("showInApp", false)
         isForcedLockMode = forceLock
         
         // ثبت کنیم که صفحه قفل در حال نمایش است
         isLockScreenShowing = true
-        
-        // دریافت اطلاعات از intent - پشتیبانی از هر دو نوع کلید (با نام جدید و قدیمی)
-        val appName = intent.getStringExtra(EXTRA_APP_NAME) ?: "این برنامه"
-        txtAppName.text = appName
         
         // مقداردهی UI
         initializeUI()
@@ -157,13 +147,13 @@ class AppLockOverlayActivity : Activity() {
         vibrator = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator?
         
         // اگر showFirst فعال است، ویبراتور را فعال کنیم برای جلب توجه بیشتر
-        if (showFirst) {
+        if (showInApp) {
             vibrateForAttention()
         }
         
         // لاگ اطلاعات قفل
-        Log.d("AppLockOverlay", "🔒 نمایش صفحه قفل برای $appName ($packageName)")
-        Log.d("AppLockOverlay", "حالت قفل اجباری: $isForcedLockMode, نمایش ابتدایی: $showFirst")
+        Log.d("AppLockOverlay", "🔒 نمایش صفحه قفل برای $packageName")
+        Log.d("AppLockOverlay", "حالت قفل اجباری: $isForcedLockMode, نمایش ابتدایی: $showInApp")
     }
     
     private fun initializeUI() {
